@@ -94,3 +94,91 @@ JARVIS_TTS_KOKORO_ENABLED=false
   services themselves keep running. Stop them manually to reclaim VRAM.
 - `jarvis-whisper-stt.service` (user-level duplicate) was disabled by Lance on
   2026-05-06 and is not affected.
+
+
+---
+
+## Programmatic service control (VRAM actually freed)
+
+Setting a toggle to `false` not only prevents jarvis-voice from *calling* the
+service — it also **stops the underlying systemd unit or Docker container** at
+startup so the GPU VRAM is reclaimed immediately.
+
+### How it works
+
+1. At startup, before the Discord client connects, `src/service-control.js`
+   inspects all three `JARVIS_*_ENABLED` flags.
+2. For each flag that is `false`, it stops the corresponding service:
+
+| Flag | Stop command issued | Default unit/container |
+|---|---|---|
+| `JARVIS_STT_ENABLED=false` | `sudo systemctl stop <unit>` | `whisper-service.service` |
+| `JARVIS_TTS_CHATTERBOX_ENABLED=false` | `systemctl --user stop <unit>` | `jarvis-chatterbox-tts.service` |
+| `JARVIS_TTS_KOKORO_ENABLED=false` | `docker stop <container>` | `kokoro` |
+
+3. If a service is already stopped, the command is skipped (logged as "already stopped").
+4. All stop failures are **logged and swallowed** — jarvis-voice continues starting up.
+5. When jarvis-voice shuts down, stopped services are **left stopped** (you enabled the
+   toggle for a reason; they restart on their own when you re-enable the flag and restart
+   jarvis-voice, assuming they are `systemd` enabled).
+
+### Customising unit / container names
+
+Add these vars to your `.env` to override defaults (useful for non-standard distro setups):
+
+```env
+# systemd SYSTEM unit name for Faster-Whisper
+JARVIS_STT_SYSTEMD_UNIT=whisper-service.service
+
+# systemd USER unit name for Chatterbox TTS
+JARVIS_TTS_CHATTERBOX_SYSTEMD_UNIT=jarvis-chatterbox-tts.service
+
+# Docker container name (or leave default and rely on port-8880 fallback)
+JARVIS_TTS_KOKORO_DOCKER_NAME=kokoro
+```
+
+### Required sudoers rule for STT (system-level unit)
+
+`whisper-service.service` is a **system** unit and requires `sudo`.  The generic
+user already has `NOPASSWD:ALL` on this machine, so no change is needed here.
+
+For other deployments, add a minimal rule (do **not** grant `ALL`):
+
+```
+# /etc/sudoers.d/jarvis-voice  (edit with: sudo visudo -f /etc/sudoers.d/jarvis-voice)
+youruser ALL=(ALL) NOPASSWD: /bin/systemctl stop whisper-service.service, /bin/systemctl start whisper-service.service
+```
+
+Replace `youruser` and the unit name if you changed `JARVIS_STT_SYSTEMD_UNIT`.
+
+If `sudo -n true` fails at startup, jarvis-voice logs a clear warning with the
+exact sudoers line to add — it never crashes.
+
+### Chatterbox (user unit) — no sudo needed
+
+`jarvis-chatterbox-tts.service` is managed with `systemctl --user stop` — no
+elevated privileges required.
+
+### Kokoro (Docker) — docker group membership
+
+The user running jarvis-voice must be in the `docker` group:
+
+```bash
+sudo usermod -aG docker $USER   # then re-login
+```
+
+If Docker is unreachable, jarvis-voice logs a warning and continues.
+
+### Docker port-8880 fallback
+
+If `JARVIS_TTS_KOKORO_DOCKER_NAME` doesn't match any running container name,
+jarvis-voice falls back to `docker ps --filter publish=8880` and stops whatever
+container is found listening on that port. This handles renamed containers
+transparently.
+
+### No auto-restart on re-enable
+
+jarvis-voice will **never** auto-start a service it stopped. When you flip a
+flag back to `true` and restart jarvis-voice, the underlying service must already
+be running (via its own `systemctl enable` / `docker run --restart=unless-stopped`
+configuration). This keeps jarvis-voice out of the service orchestration business.

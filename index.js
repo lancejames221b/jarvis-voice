@@ -43,6 +43,7 @@ import { isVisualModeEnabled, getVisualTargetChannel, setVisualTargetChannel } f
 import { isVerboseModeEnabled } from './verbose-mode.js';
 import { verboseSessions } from './verbose-sessions.js';
 import { getCurrentTtsProvider, getCurrentWakeWord } from './tts-toggle.js';
+import { applyServiceToggles } from "./service-control.js";
 import { isVerifiedOwner, passesAuthGate, enrollmentState } from './auth.js';
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete } from './slash-commands.js';
 import { handleSessionMessage, isSessionChannel } from './slash/session.js';
@@ -4878,5 +4879,8 @@ if (missing.length > 0) {
 
 // STT provider health check - warns if local provider unreachable, never exits
 checkSttHealth().catch(() => {});
+
+// Stop underlying GPU services for any disabled voice toggles before connecting
+applyServiceToggles().catch(() => {});
 
 client.login(process.env.DISCORD_TOKEN);
