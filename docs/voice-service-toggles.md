@@ -182,3 +182,62 @@ jarvis-voice will **never** auto-start a service it stopped. When you flip a
 flag back to `true` and restart jarvis-voice, the underlying service must already
 be running (via its own `systemctl enable` / `docker run --restart=unless-stopped`
 configuration). This keeps jarvis-voice out of the service orchestration business.
+
+
+---
+
+## Discord admin commands (live runtime control)
+
+Instead of ssh-ing in to edit `.env` and restart, Lance can toggle services
+directly from any Discord channel where the bot is present.
+
+### Prerequisites
+
+Set `JARVIS_ADMIN_USER_IDS` in `.env` to the comma-separated Discord user IDs
+that are allowed to run these commands:
+
+```env
+JARVIS_ADMIN_USER_IDS=928436617159520338
+```
+
+If unset, the bot falls back to `OWNER_USER_ID`, then the first entry in
+`ALLOWED_USERS`.  Non-admin senders are silently ignored.
+
+### Commands
+
+Send these as a @mention or DM to the bot (case-insensitive):
+
+| Command | Effect |
+|---|---|
+| `@jarvis voice off` | Stop all three (STT + Chatterbox + Kokoro) immediately + persist flags |
+| `@jarvis voice on` | Start all three immediately + persist flags |
+| `@jarvis voice status` | Show current active/inactive state + env-var values |
+| `@jarvis stt off` / `stt on` | Toggle just Whisper STT |
+| `@jarvis tts off` / `tts on` | Toggle both Chatterbox + Kokoro |
+| `@jarvis chatterbox off/on` | Toggle just Chatterbox |
+| `@jarvis kokoro off/on` | Toggle just Kokoro |
+| `@jarvis voice help` | List available commands |
+
+### What happens on `voice off`
+
+1. `stopSTT()` → `sudo systemctl stop whisper-service.service`
+2. `stopChatterbox()` → `systemctl --user stop jarvis-chatterbox-tts.service`
+3. `stopKokoro()` → `systemctl --user stop kokoro-tts.service`
+4. `.env` updated atomically: all three `JARVIS_*_ENABLED=false`
+5. `process.env` updated immediately (no restart needed for the flag itself)
+6. Bot replies: `✓ voice off — STT, Chatterbox, Kokoro stopped`
+
+### What happens on `kokoro on`
+
+Kokoro was disabled (systemd-disabled) on 2026-05-06 to prevent auto-start at
+boot. The `voice on` / `kokoro on` commands re-enable the unit before starting:
+
+1. `systemctl --user enable kokoro-tts.service`
+2. `systemctl --user start kokoro-tts.service`
+
+### Implementation files
+
+- `src/discord-voice-commands.js` — parser, admin check, executor, reply builder
+- `src/service-control.js` — start/stop helpers + `persistEnvVars()` + `queryServiceStatus()`
+- `src/index.js` — wired into `handleMentionReply()` before LLM dispatch
+- `src/__tests__/discord-voice-commands.test.js` — 33 unit tests

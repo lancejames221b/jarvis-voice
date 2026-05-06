@@ -289,41 +289,41 @@ describe('applyServiceToggles — service-control.js', () => {
     expect(stopCall).toBeFalsy();
   });
 
-  it('calls docker stop for Kokoro when JARVIS_TTS_KOKORO_ENABLED=false', async () => {
+  it('calls systemctl --user stop for Kokoro when JARVIS_TTS_KOKORO_ENABLED=false', async () => {
     process.env.JARVIS_TTS_KOKORO_ENABLED = 'false';
     execMock.mockImplementation((cmd, _opts, cb) => {
-      if (cmd === 'docker info --format "{{.ServerVersion}}"') return cb(null, '24.0.0', '');
-      if (cmd.includes('filter name=')) return cb(null, 'kokoro', '');
-      if (cmd === 'docker stop kokoro') return cb(null, 'kokoro', '');
+      if (cmd.includes('is-active')) return cb(null, 'active', '');
       cb(null, '', '');
     });
     const sc = await import('../service-control.js');
     await sc.applyServiceToggles();
-    const stopCall = execMock.mock.calls.find(c => c[0] === 'docker stop kokoro');
+    const stopCall = execMock.mock.calls.find(
+      c => c[0] === 'systemctl --user stop kokoro-tts.service'
+    );
     expect(stopCall).toBeTruthy();
   });
 
-  it('falls back to port-8880 container when named container not found', async () => {
+  it('skips Kokoro stop when unit is already inactive', async () => {
     process.env.JARVIS_TTS_KOKORO_ENABLED = 'false';
     execMock.mockImplementation((cmd, _opts, cb) => {
-      if (cmd === 'docker info --format "{{.ServerVersion}}"') return cb(null, '24.0.0', '');
-      if (cmd.includes('filter name=')) return cb(null, '', '');  // named not found
-      if (cmd.includes('filter publish=8880')) return cb(null, 'kokoro-alt', '');
-      if (cmd === 'docker stop kokoro-alt') return cb(null, 'kokoro-alt', '');
+      if (cmd.includes('is-active')) return cb(null, 'inactive', '');
       cb(null, '', '');
     });
     const sc = await import('../service-control.js');
     await sc.applyServiceToggles();
-    const stopCall = execMock.mock.calls.find(c => c[0] === 'docker stop kokoro-alt');
-    expect(stopCall).toBeTruthy();
+    const stopCall = execMock.mock.calls.find(
+      c => c[0].includes('systemctl --user stop') && c[0].includes('kokoro')
+    );
+    expect(stopCall).toBeFalsy();
   });
 
-  it('does not throw when docker stop fails', async () => {
+  it('does not throw when systemctl --user stop fails for Kokoro', async () => {
     process.env.JARVIS_TTS_KOKORO_ENABLED = 'false';
     execMock.mockImplementation((cmd, _opts, cb) => {
-      if (cmd === 'docker info --format "{{.ServerVersion}}"') return cb(null, '24.0.0', '');
-      if (cmd.includes('filter name=')) return cb(null, 'kokoro', '');
-      if (cmd === 'docker stop kokoro') return cb(new Error('no such container'), '', 'no such container');
+      if (cmd.includes('is-active')) return cb(null, 'active', '');
+      if (cmd.includes('systemctl --user stop kokoro')) {
+        return cb(new Error('Unit kokoro-tts.service not found'), '', 'Unit not found');
+      }
       cb(null, '', '');
     });
     const sc = await import('../service-control.js');
@@ -333,10 +333,10 @@ describe('applyServiceToggles — service-control.js', () => {
   it('exports SERVICE_UNITS with correct defaults', async () => {
     delete process.env.JARVIS_STT_SYSTEMD_UNIT;
     delete process.env.JARVIS_TTS_CHATTERBOX_SYSTEMD_UNIT;
-    delete process.env.JARVIS_TTS_KOKORO_DOCKER_NAME;
+    delete process.env.JARVIS_TTS_KOKORO_SYSTEMD_UNIT;
     const sc = await import('../service-control.js');
     expect(sc.SERVICE_UNITS.STT_UNIT).toBe('whisper-service.service');
     expect(sc.SERVICE_UNITS.CHATTERBOX_UNIT).toBe('jarvis-chatterbox-tts.service');
-    expect(sc.SERVICE_UNITS.KOKORO_DOCKER).toBe('kokoro');
+    expect(sc.SERVICE_UNITS.KOKORO_UNIT).toBe('kokoro-tts.service');
   });
 });
