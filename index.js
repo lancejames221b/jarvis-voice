@@ -43,6 +43,7 @@ import { isVisualModeEnabled, getVisualTargetChannel, setVisualTargetChannel } f
 import { isVerboseModeEnabled } from './verbose-mode.js';
 import { verboseSessions } from './verbose-sessions.js';
 import { getCurrentTtsProvider, getCurrentWakeWord } from './tts-toggle.js';
+import { applyServiceToggles } from "./service-control.js";
 import { isVerifiedOwner, passesAuthGate, enrollmentState } from './auth.js';
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete } from './slash-commands.js';
 import { handleSessionMessage, isSessionChannel } from './slash/session.js';
@@ -1345,7 +1346,9 @@ client.once('ready', async () => {
 
   // Chatterbox GPU warmup — fire a silent synthesis on startup to force CUDA model load.
   // Without this the first real TTS request triggers a 30s+ cold-start GPU load.
-  if ((process.env.TTS_PROVIDER || '').toLowerCase() === 'chatterbox') {
+  // Skipped if JARVIS_TTS_CHATTERBOX_ENABLED=false (no GPU VRAM allocated).
+  if ((process.env.TTS_PROVIDER || '').toLowerCase() === 'chatterbox' &&
+      process.env.JARVIS_TTS_CHATTERBOX_ENABLED !== 'false') {
     logger.info('🔥 Chatterbox GPU warmup starting...');
     synthesizeSpeech('Warming up.').then(audio => {
       if (audio) try { unlinkSync(audio); } catch {} // discard, just warming GPU
@@ -4876,5 +4879,8 @@ if (missing.length > 0) {
 
 // STT provider health check - warns if local provider unreachable, never exits
 checkSttHealth().catch(() => {});
+
+// Stop underlying GPU services for any disabled voice toggles before connecting
+applyServiceToggles().catch(() => {});
 
 client.login(process.env.DISCORD_TOKEN);

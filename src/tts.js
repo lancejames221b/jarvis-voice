@@ -61,6 +61,20 @@ const QWEN3_URL      = process.env.QWEN3_TTS_URL      || 'http://127.0.0.1:3341'
 const QWEN3_INSTRUCT = process.env.QWEN3_TTS_VOICE    || '';  // empty = use server default
 const QWEN3_LANG     = process.env.QWEN3_TTS_LANG     || 'english';
 
+// ── Per-provider GPU enable/disable toggles ──────────────────────────
+// Set to 'false' to disable a GPU-backed TTS service without editing TTS_PROVIDER.
+// When the active TTS_PROVIDER is disabled, synthesizeSpeech() falls back to the
+// next enabled provider in the chain: chatterbox → kokoro → piper → edge → text-only.
+// Default: true for all (backward-compatible — existing behavior unchanged).
+//
+// JARVIS_TTS_CHATTERBOX_ENABLED=false  — unloads Chatterbox from GPU, uses fallback
+// JARVIS_TTS_KOKORO_ENABLED=false      — disables Kokoro docker container calls
+//
+// Note: piper and edge are CPU-only and are always available as fallbacks;
+// they do not have dedicated toggle flags.
+const TTS_CHATTERBOX_ENABLED = process.env.JARVIS_TTS_CHATTERBOX_ENABLED !== 'false'; // default ON
+const TTS_KOKORO_ENABLED     = process.env.JARVIS_TTS_KOKORO_ENABLED     !== 'false'; // default ON
+
 // ── TTS Circuit Breaker ──────────────────────────────────────────────
 // After 3 Edge TTS failures within 5 minutes, stop trying for 5 minutes.
 // Returns null so callers degrade to text-only delivery.
@@ -129,10 +143,12 @@ export function getTTSHealth() {
   }
   if (provider === 'kokoro') {
     const voice = process.env.KOKORO_VOICE || 'bm_lewis';
+    if (!TTS_KOKORO_ENABLED) return `kokoro-${voice} DISABLED (JARVIS_TTS_KOKORO_ENABLED=false) — fallback active`;
     return `kokoro-${voice} @ ${KOKORO_URL} (fallback: none — text-only on failure)`;
   }
   if (provider === 'chatterbox') {
     const voice = process.env.CHATTERBOX_VOICE || 'jarvis';
+    if (!TTS_CHATTERBOX_ENABLED) return `chatterbox-${voice} DISABLED (JARVIS_TTS_CHATTERBOX_ENABLED=false) — fallback active`;
     return `chatterbox-${voice} (fallback: none — text-only on failure)`;
   }
   if (provider === 'piper' && process.env.PIPER_ENABLED !== 'false') {
@@ -218,6 +234,10 @@ export async function synthesizeSpeech(text) {
 
   // Kokoro (British male voice) — only when TTS_PROVIDER=kokoro
   if (provider === 'kokoro') {
+    if (!TTS_KOKORO_ENABLED) {
+      logger.info('[tts] Kokoro disabled (JARVIS_TTS_KOKORO_ENABLED=false) — falling back to edge');
+      return synthesizeEdge(sanitized);
+    }
     const result = await synthesizeKokoro(sanitized);
     if (result) return result;
     logger.warn('Kokoro TTS failed, retrying once in 500ms...');
@@ -230,6 +250,10 @@ export async function synthesizeSpeech(text) {
 
   // Chatterbox TTS (voice clone) — only when TTS_PROVIDER=chatterbox
   if (provider === 'chatterbox') {
+    if (!TTS_CHATTERBOX_ENABLED) {
+      logger.info('[tts] Chatterbox disabled (JARVIS_TTS_CHATTERBOX_ENABLED=false) — falling back to edge');
+      return synthesizeEdge(sanitized);
+    }
     const result = await synthesizeChatterbox(sanitized);
     if (result) return result;
     logger.warn('⚠️ Chatterbox TTS failed, retrying once in 500ms...');
@@ -342,6 +366,10 @@ async function synthesizeKokoro(text) {
  * @returns {Promise<void>}
  */
 export async function synthesizeKokoroStream(text, onFile) {
+  if (!TTS_KOKORO_ENABLED) {
+    logger.info("[tts] Kokoro disabled (JARVIS_TTS_KOKORO_ENABLED=false) — skipping Kokoro stream");
+    return;
+  }
   try {
     const start = Date.now();
     const res = await fetch(`${KOKORO_URL}/v1/audio/speech`, {
@@ -386,6 +414,10 @@ export async function synthesizeKokoroStream(text, onFile) {
  * @returns {Promise<void>}
  */
 export async function synthesizeChatterboxStream(text, onFile) {
+  if (!TTS_CHATTERBOX_ENABLED) {
+    logger.info("[tts] Chatterbox disabled (JARVIS_TTS_CHATTERBOX_ENABLED=false) — skipping Chatterbox stream");
+    return;
+  }
   try {
     const res = await fetch(`${CHATTERBOX_URL}/tts/stream`, {
       method: 'POST',
@@ -717,6 +749,10 @@ export function splitIntoSentences(text) {
  */
 export async function switchChatterboxVoice(voice, { throwOnFail = false } = {}) {
   if ((process.env.TTS_PROVIDER || 'piper').toLowerCase() !== 'chatterbox') return;
+  if (!TTS_CHATTERBOX_ENABLED) {
+    logger.info('[chatterbox] Chatterbox disabled (JARVIS_TTS_CHATTERBOX_ENABLED=false) — skipping voice switch');
+    return;
+  }
   if (!voice) return;
   const prev = _activeChatterboxVoice;
   _activeChatterboxVoice = voice;
