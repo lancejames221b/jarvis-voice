@@ -1281,6 +1281,84 @@ export async function generateTextResponse(userMessage, options = {}) {
   }
 }
 
+/**
+ * Render the last N user/assistant turns into a compact transcript block.
+ * The task-agent path spawns a fresh Claude session per turn (no --resume), so
+ * without this prelude every voice utterance behaves like a brand-new conversation
+ * and forgets the prior exchange. Trimmed for size; full state lives in haivemind.
+ */
+function _formatTaskAgentHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) return '';
+  // Drop the trailing user turn — that's the current message, included separately
+  const turns = history.slice(0, -1).filter(m => m && m.role && m.content);
+  if (turns.length === 0) return '';
+  const recent = turns.slice(-6); // last 3 exchanges, enough for follow-up context
+  const lines = recent.map(m => {
+    const role = m.role === 'assistant' ? 'JARVIS' : 'USER';
+    const text = String(m.content).substring(0, 600).replace(/\s+/g, ' ').trim();
+    return `${role}: ${text}`;
+  });
+  return `[RECENT VOICE CONVERSATION — for continuity; treat the user's current message as the active turn]\n${lines.join('\n')}\n\n`;
+}
+
+function buildTaskAgentPrompt(userMessage, options = {}) {
+  const _now = new Date();
+  let contextTags = `[DATETIME: ${_now.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}] `;
+  if (options.speaker) contextTags += `[SPEAKER: ${options.speaker}] `;
+  if (options.sentiment?.sentiment && options.sentiment.sentiment !== 'neutral') {
+    contextTags += `[SENTIMENT: ${options.sentiment.sentiment}] `;
+  }
+  const focusCtx = getFullFocusContext() || getFocusContextTag();
+  if (focusCtx) contextTags += focusCtx + ' ';
+
+  // Conversation continuity: task-agent gateway path uses channelKey "task-agent:<id>"
+  // which always spawns a fresh claude -p session (chatId=null, no --resume). Without
+  // injecting recent turns here, every voice ACTION/EMAIL/CALENDAR/etc utterance loses
+  // memory of the prior exchange — Lance's "mid-lost everything" voice symptom.
+  const historyBlock = _formatTaskAgentHistory(options.history);
+
+  const taskId = String(options.taskId || '').replace(/'/g, '');
+  // Single-quote-safe snippet for shell embedding — apostrophes in speech break mcporter arg parsing
+  const safeSnip = userMessage.substring(0, 120).replace(/"/g, '\\"').replace(/'/g, "\\'");
+  return `${getVoiceTag()}
+
+${historyBlock}${contextTags}${userMessage}
+
+TASK AGENT INSTRUCTIONS:
+- You are a disposable task agent with full tool access. Complete this task fully.
+- When done, POST a 2-3 sentence spoken summary via /speak:
+curl -s -X POST ${SPEAK_URL} -H "Authorization: Bearer ${SPEAK_TOKEN}" -H "Content-Type: application/json" -d '{"message":"YOUR_SUMMARY","source":"task-agent","taskId":"${taskId}"}'
+- Store the result to hAIveMind for session recall:
+mcporter call haivemind.store_memory content="TASK-AGENT ${_now.toISOString().substring(0, 16)} task=${taskId}: request=\\"${safeSnip}\\" result=\\"SUMMARY\\"" category="voice-session"
+- Keep the spoken summary to 2-3 sentences maximum.`;
+}
+
+export async function runTaskAgent(userMessage, options = {}) {
+  const prompt = buildTaskAgentPrompt(userMessage, options);
+  const model  = options.agentModel || options.model || voiceModel;
+  try {
+    const res = await fetch(TASK_RUN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GATEWAY_TOKEN}`,
+      },
+      body: JSON.stringify({ prompt, model, taskId: options.taskId }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      logger.error('Task agent dispatch failed:', res.status, body);
+      return { dispatched: false, error: `${res.status}: ${body}` };
+    }
+    logger.info('🤖 Dispatched to task agent (isolated session, full MCP)');
+    return { dispatched: true };
+  } catch (err) {
+    logger.error('Task agent dispatch error:', err.message);
+    return { dispatched: false, error: err.message };
+  }
+}
+
 export async function dispatchViaWebhook(userMessage, history = [], options = {}) {
   const _now = new Date();
   let contextTags = `[DATETIME: ${_now.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}] `;
