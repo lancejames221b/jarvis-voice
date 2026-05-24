@@ -1445,7 +1445,56 @@ client.once('ready', async () => {
     const cleaned = wakeResult.stripped || text;
     const focusChannelId = getFocus()?.channelId || null;
     const dispatch = await dispatchCommand(text, cleaned, effectiveUserId, ALLOWED_USERS, enrollmentState, focusChannelId);
-    return { type: dispatch.type, wakeWord: wakeResult.detected, transcript: text, dispatch };
+
+    // ── Pass-through for non-brain dispatch types (mode toggles, shortcuts) ──
+    if (dispatch.type !== 'brain') {
+      return { type: dispatch.type, wakeWord: wakeResult.detected, transcript: text, dispatch };
+    }
+
+    // ── Brain path: replicate the real STT brain dispatch (index.js:4739-4816) ──
+    // Add to conversation history like real STT does
+    if (!conversations.has(effectiveUserId)) {
+      conversations.set(effectiveUserId, { history: [], lastActive: Date.now() });
+    }
+    const conv = conversations.get(effectiveUserId);
+    conv.lastActive = Date.now();
+
+    // Cold-start context seed for first utterance (skip if client not ready — e.g. /test/stt without bot in voice channel)
+    if (conv.history.length === 0 && client?.isReady()) {
+      try {
+        const focus = getFocus();
+        const seedChannelId = focus?.channelId || null;
+        if (seedChannelId) {
+          const seedCh = await client.channels.fetch(seedChannelId).catch(() => null);
+          if (seedCh?.messages) {
+            const msgs = await seedCh.messages.fetch({ limit: 10 });
+            if (msgs.size > 0) {
+              const lines = Array.from(msgs.values())
+                .reverse()
+                .map(m => {
+                  const who = m.author.bot ? `[bot] ${m.author.username}` : m.author.username;
+                  return `${who}: ${(m.content || '').substring(0, 300).replace(/\n/g, ' ')}`;
+                })
+                .join('\n');
+              const label = seedCh.isThread?.()
+                ? `thread "${seedCh.name}" in #${seedCh.parent?.name || seedCh.parentId}`
+                : `#${seedCh.name}`;
+              conv.history.push({ role: 'assistant', content: `[Voice session started. Recent messages from ${label}:]\n${lines}` });
+            }
+          }
+        }
+      } catch (e) { /* seed failure is non-fatal */ }
+    }
+
+    const workspaceContext = dispatch.workspaceContext ? `${dispatch.workspaceContext}\n\n` : '';
+    conv.history.push({ role: 'user', content: `${workspaceContext}${dispatch.transcript || cleaned}` });
+    trimHistory(conv.history);
+
+    // Queue as a brain task (same debounce path as real STT)
+    queueUtterance(effectiveUserId, dispatch.transcript || cleaned, conv, null, null);
+
+    logger.info(`🧪 /test/stt dispatched brain task for "${(dispatch.transcript || cleaned).substring(0, 60)}"`);
+    return { type: 'brain', wakeWord: wakeResult.detected, transcript: text, dispatch };
   });
 
   // Wire follow-up detection into the TV noise filter (intent-classifier.js)
