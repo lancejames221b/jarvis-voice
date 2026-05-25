@@ -752,6 +752,7 @@ async function postDiscordMessage(channelId, content) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ content: chunk }),
+      signal: AbortSignal.timeout(10_000), // 10s timeout — prevents hanging if Discord API is slow
     });
     if (!response.ok) {
       const body = await response.text();
@@ -787,6 +788,9 @@ async function storeMemory(content, category = "global") {
 
 async function postSpeakSummary(message, taskId) {
   if (!ALERT_WEBHOOK_TOKEN || !message) return;
+  // Timeout prevents hanging if jarvis-voice is unresponsive (OOM, restart, etc.)
+  // A failed /speak callback means the task won't get its result delivered, but at least
+  // the gateway doesn't hang indefinitely blocking the entire microtask chain.
   await fetch(SPEAK_URL, {
     method: "POST",
     headers: {
@@ -794,6 +798,7 @@ async function postSpeakSummary(message, taskId) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ message, source: "task-progress", taskId }),
+    signal: AbortSignal.timeout(10_000), // 10s timeout — prevents indefinite hangs
   });
 }
 

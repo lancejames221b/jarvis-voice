@@ -48,7 +48,7 @@ const TERMINAL_STATES = new Set([TaskState.COMPLETED, TaskState.FAILED, TaskStat
 // WORKING = confirmed background work (sub-agents, research) → long timeout
 const DISPATCHED_ORPHAN_MS = parseInt(process.env.TASK_DISPATCHED_ORPHAN_MS ?? '120000');   // 2 min
 const ORPHAN_THRESHOLD_MS = parseInt(process.env.TASK_ORPHAN_THRESHOLD_MS ?? '300000');      // 5 min
-const WORKING_ORPHAN_MS = parseInt(process.env.TASK_WORKING_ORPHAN_MS ?? '1800000');         // 30 min
+const WORKING_ORPHAN_MS = parseInt(process.env.TASK_WORKING_ORPHAN_MS ?? '900000');          // 15 min
 // How long to keep completed tasks in ledger (1 hour)
 const COMPLETED_TTL_MS = 60 * 60 * 1000;
 // Max ledger entries to prevent unbounded growth
