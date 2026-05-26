@@ -82,7 +82,6 @@ import { getActivePersona, switchPersonaFull } from '../brain/brain.js';
 import { setCurrentVoiceChannelId } from '../alert-webhook.js';
 import { isVisualModeEnabled } from '../visual-mode.js';
 import { isTldrModeEnabled, isTranscriptModeEnabled } from '../tldr-mode.js';
-import { postTaskToThread } from '../discord/thread-router.js';
 import { getAllowedUserIds } from '../allowed-users.js';
 import { markBriefingDelivered, generateBriefing, shouldBrief } from '../join-briefing.js';
 import { activate as muteQueueActivate, deactivate as muteQueueDeactivate, isActive as isMuteQueueActive, addEntry as muteQueueAdd, hasEntries as muteQueueHasEntries, getSummary as muteQueueSummary, getContextBlock as muteQueueContext, clear as muteQueueClear, getCount as muteQueueCount } from '../state/mute-queue.js';

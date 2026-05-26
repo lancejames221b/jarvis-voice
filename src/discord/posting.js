@@ -182,7 +182,15 @@ export async function postTranscriptThread(taskId, userTranscript, jarvisRespons
       autoArchiveDuration: 1440,
     });
 
-    await thread.send(`**Jarvis Response:**\n${jarvisResponse}\n\n_Task completed in ${duration}s_`);
+    // Post Jarvis response chunked at 1900 chars (Discord limit is 2000)
+    const _ptChunks = [];
+    const _ptResp = jarvisResponse.trim();
+    for (let i = 0; i < _ptResp.length; i += 1900) _ptChunks.push(_ptResp.substring(i, i + 1900));
+    for (let ci = 0; ci < _ptChunks.length; ci++) {
+      const pfx = ci === 0 ? '**Jarvis Response:**\n' : '';
+      const sfx = ci === _ptChunks.length - 1 ? `\n\n_Task completed in ${duration}s_` : '';
+      await thread.send(`${pfx}${_ptChunks[ci]}${sfx}`);
+    }
 
     logger.info(`✅ Posted voice transcript thread (task #${taskId}) to ${channel.name}`);
     return true;
