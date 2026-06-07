@@ -25,6 +25,12 @@ if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true });
 
 const STREAMING_TTS_ENABLED = process.env.STREAMING_TTS_ENABLED !== 'false'; // Default true
 
+// ── GPU service toggles ──────────────────────────────────────────────
+// JARVIS_TTS_CHATTERBOX_ENABLED=false  — unloads Chatterbox from GPU, uses fallback
+// JARVIS_TTS_KOKORO_ENABLED=false      — disables Kokoro docker container calls, uses fallback
+const TTS_CHATTERBOX_ENABLED = process.env.JARVIS_TTS_CHATTERBOX_ENABLED !== 'false'; // default ON
+const TTS_KOKORO_ENABLED     = process.env.JARVIS_TTS_KOKORO_ENABLED     !== 'false'; // default ON
+
 // Find edge-tts binary
 const EDGE_TTS_BIN = process.env.EDGE_TTS_PATH || `${process.env.HOME}/.local/bin/edge-tts`;
 
@@ -129,10 +135,12 @@ export function getTTSHealth() {
   }
   if (provider === 'kokoro') {
     const voice = process.env.KOKORO_VOICE || 'bm_lewis';
+    if (!TTS_KOKORO_ENABLED) return `kokoro-${voice} DISABLED (JARVIS_TTS_KOKORO_ENABLED=false) — fallback active`;
     return `kokoro-${voice} @ ${KOKORO_URL} (fallback: none — text-only on failure)`;
   }
   if (provider === 'chatterbox') {
     const voice = process.env.CHATTERBOX_VOICE || 'jarvis';
+    if (!TTS_CHATTERBOX_ENABLED) return `chatterbox-${voice} DISABLED (JARVIS_TTS_CHATTERBOX_ENABLED=false) — fallback active`;
     return `chatterbox-${voice} (fallback: none — text-only on failure)`;
   }
   if (provider === 'piper' && process.env.PIPER_ENABLED !== 'false') {
@@ -342,6 +350,10 @@ async function synthesizeKokoro(text) {
  * @returns {Promise<void>}
  */
 export async function synthesizeKokoroStream(text, onFile) {
+  if (!TTS_KOKORO_ENABLED) {
+    logger.info("[tts] Kokoro disabled (JARVIS_TTS_KOKORO_ENABLED=false) — skipping Kokoro stream");
+    return;
+  }
   try {
     const start = Date.now();
     const res = await fetch(`${KOKORO_URL}/v1/audio/speech`, {
@@ -386,6 +398,10 @@ export async function synthesizeKokoroStream(text, onFile) {
  * @returns {Promise<void>}
  */
 export async function synthesizeChatterboxStream(text, onFile) {
+  if (!TTS_CHATTERBOX_ENABLED) {
+    logger.info("[tts] Chatterbox disabled (JARVIS_TTS_CHATTERBOX_ENABLED=false) — skipping Chatterbox stream");
+    return;
+  }
   try {
     const res = await fetch(`${CHATTERBOX_URL}/tts/stream`, {
       method: 'POST',

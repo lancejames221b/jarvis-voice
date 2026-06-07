@@ -16,6 +16,10 @@ import 'dotenv/config';
 
 const execFileAsync = promisify(execFile);
 
+// JARVIS_STT_ENABLED=false disables all speech recognition. The bot continues to
+// run text-only (no GPU usage for STT). Default ON.
+const STT_ENABLED = process.env.JARVIS_STT_ENABLED !== 'false'; // default ON
+
 const STT_PROVIDER = process.env.STT_PROVIDER || 'whisper'; // 'whisper' (local, free), 'deepgram', 'moonshine', or 'vosk'
 const WHISPER_BIN = process.env.WHISPER_PATH || `${process.env.HOME}/.local/bin/whisper`;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'tiny'; // tiny=fast (~3s), base/small=better accuracy
@@ -91,6 +95,7 @@ const STT_CIRCUIT_BREAKER = {
  * Get current STT health status for monitoring
  */
 export function getSTTHealth() {
+  if (!STT_ENABLED) return 'disabled (JARVIS_STT_ENABLED=false)';
   return STT_CIRCUIT_BREAKER.getStatus();
 }
 
@@ -514,8 +519,14 @@ export async function transcribeWhisperOnly(wavPath) {
 }
 
 export async function transcribeAudio(wavPath) {
+  // JARVIS_STT_ENABLED=false: skip all transcription (no GPU usage, bot stays text-only)
+  if (!STT_ENABLED) {
+    logger.info('[stt] STT disabled (JARVIS_STT_ENABLED=false) — skipping transcription');
+    return { text: '', sentiment: null, segments: [], rejected: 'stt_disabled' };
+  }
+
   let result;
-  
+
   // Moonshine (fast local STT, ~2-3s per transcription)
   if (STT_PROVIDER === 'moonshine') {
     try {
@@ -877,6 +888,11 @@ async function transcribeWithVosk(wavPath) {
  * Does not exit on failure — allows graceful degradation.
  */
 export async function checkSttHealth() {
+  if (!STT_ENABLED) {
+    logger.info('[stt] STT disabled (JARVIS_STT_ENABLED=false) — skipping health check');
+    return;
+  }
+
   const provider = process.env.STT_PROVIDER ?? 'faster-whisper';
   const url = process.env.STT_URL ?? process.env.WHISPER_URL ?? process.env.MLX_WHISPER_URL;
 
