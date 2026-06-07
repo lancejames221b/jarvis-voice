@@ -15,7 +15,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 // ── Mocks ────────────────────────────────────────────────────────────
 vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-vi.mock('../stt.js', () => ({
+vi.mock('../voice/stt.js', () => ({
   transcribeAudio: vi.fn(async () => ({
     text: 'Jarvis, what time is it',
     confidence: 0.95,
@@ -25,7 +25,7 @@ vi.mock('../stt.js', () => ({
   getSTTHealth: vi.fn(() => 'whisper'),
 }));
 
-vi.mock('../brain.js', () => ({
+vi.mock('../brain/brain.js', () => ({
   generateResponseStreaming: vi.fn(async (msg, history, signal, onSentence) => {
     onSentence('It is 2:30 PM.', false);
     return 'It is 2:30 PM.';
@@ -36,13 +36,13 @@ vi.mock('../brain.js', () => ({
   getActivePersona: vi.fn(() => ({ name: 'jarvis' })),
 }));
 
-vi.mock('../tts.js', () => ({
+vi.mock('../voice/tts.js', () => ({
   synthesizeSpeech: vi.fn(async () => Buffer.from('fake-audio')),
   isTTSAvailable: vi.fn(() => true),
 }));
 
 // Dependencies that command-dispatch needs
-vi.mock('../shortcut-engine.js', () => ({
+vi.mock('../discord/shortcut-engine.js', () => ({
   tryShortcut: vi.fn(async () => ({ handled: false })),
 }));
 
@@ -64,17 +64,17 @@ vi.mock('../visual-mode.js', () => ({
   setVisualTargetChannel: vi.fn(() => true),
 }));
 
-vi.mock('../tts-toggle.js', () => ({
+vi.mock('../voice/tts-toggle.js', () => ({
   isTtsToggleCommand: vi.fn(() => null),
   setTtsProvider: vi.fn(() => ({ ok: true, provider: 'edge' })),
 }));
 
-vi.mock('../intent-classifier.js', () => ({
+vi.mock('../brain/intent-classifier.js', () => ({
   shouldDismiss: vi.fn(() => ({ dismiss: false })),
   isSideTalk: vi.fn(() => false),
 }));
 
-vi.mock('../focus-state.js', () => ({
+vi.mock('../state/focus-state.js', () => ({
   setFocusByName: vi.fn(() => null),
   setFocusWithThread: vi.fn(async () => null),
   clearFocus: vi.fn(),
@@ -82,26 +82,26 @@ vi.mock('../focus-state.js', () => ({
   listChannels: vi.fn(() => []),
 }));
 
-vi.mock('../channel-router.js', () => ({
+vi.mock('../discord/channel-router.js', () => ({
   detectChannelCommand: vi.fn(() => ({ action: null, target: null, raw: '' })),
 }));
 
-vi.mock('../fuzzy-dispatch.js', () => ({
+vi.mock('../discord/fuzzy-dispatch.js', () => ({
   fuzzyMatch: vi.fn(() => ({ matched: false })),
 }));
 
-vi.mock('../haiku-intent.js', () => ({
+vi.mock('../brain/haiku-intent.js', () => ({
   classifyIntent: vi.fn(async () => null),
 }));
 
 // ── Real imports (after mocks) ────────────────────────────────────
-import { checkWakeWord } from '../wakeword.js';
-import { dispatchCommand } from '../command-dispatch.js';
-import { synthesizeSpeech } from '../tts.js';
-import { generateResponseStreaming } from '../brain.js';
+import { checkWakeWord } from '../voice/wakeword.js';
+import { dispatchCommand } from '../discord/command-dispatch.js';
+import { synthesizeSpeech } from '../voice/tts.js';
+import { generateResponseStreaming } from '../brain/brain.js';
 import * as visualMode from '../visual-mode.js';
-import * as focusState from '../focus-state.js';
-import * as intentClassifier from '../intent-classifier.js';
+import * as focusState from '../state/focus-state.js';
+import * as intentClassifier from '../brain/intent-classifier.js';
 
 // ── Test config ──────────────────────────────────────────────────
 const ADMIN_ID = 'user-admin-001';

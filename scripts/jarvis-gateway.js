@@ -1,13 +1,15 @@
+import "../src/config-env-bootstrap.js";
 import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { WebSocketServer } from "ws";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const PORT = Number(process.env.ZEROCLAW_COMPAT_PORT || 22103);
-const ZEROCLAW_BASE_URL = process.env.ZEROCLAW_BASE_URL || "http://127.0.0.1:22101";
+const PORT = Number(process.env.JARVIS_GATEWAY_PORT || process.env.ZEROCLAW_COMPAT_PORT || 22100);
+const ZEROCLAW_BASE_URL = process.env.JARVIS_BACKEND_URL || process.env.ZEROCLAW_BASE_URL || "http://127.0.0.1:22101";
 const GATEWAY_TOKEN = process.env.JARVIS_GATEWAY_TOKEN || "";
 // Shell aliases (like `claude --dangerously-skip-permissions`) don't survive spawn().
 // Use the actual binary path and pass flags explicitly.
@@ -53,11 +55,11 @@ const DEFAULT_REPORT_CHANNEL = process.env.DISCORD_REPORT_CHANNEL_ID || process.
 const ALERT_WEBHOOK_TOKEN = process.env.ALERT_WEBHOOK_TOKEN || "";
 const ALERT_WEBHOOK_PORT = process.env.ALERT_WEBHOOK_PORT || "3335";
 const ALERT_WEBHOOK_HOST = process.env.TAILSCALE_IP || process.env.ALERT_WEBHOOK_HOST || "127.0.0.1";
-const SPEAK_URL = process.env.ZEROCLAW_COMPAT_SPEAK_URL || `http://${ALERT_WEBHOOK_HOST}:${ALERT_WEBHOOK_PORT}/speak`;
+const SPEAK_URL = process.env.JARVIS_SPEAK_URL || process.env.ZEROCLAW_COMPAT_SPEAK_URL || `http://${ALERT_WEBHOOK_HOST}:${ALERT_WEBHOOK_PORT}/speak`;
 // Persist sessions to ~/.local/state so chatIds survive service restarts and reboots.
 // /tmp is wiped on reboot; every restart meant fresh cursor-agent contexts.
 const _defaultSessionDir = `${process.env.HOME}/.local/state/jarvis-voice`;
-const SESSION_STORE_PATH = process.env.SESSION_STORE_PATH || `${_defaultSessionDir}/zeroclaw-sessions.json`;
+const SESSION_STORE_PATH = process.env.SESSION_STORE_PATH || `${_defaultSessionDir}/jarvis-sessions.json`;
 const CHANNEL_ACCOUNTS_PATH = process.env.CHANNEL_ACCOUNTS_PATH || `${_defaultSessionDir}/channel-accounts.json`;
 // Ensure the state directory exists (harmless if already present)
 try { fs.mkdirSync(_defaultSessionDir, { recursive: true }); } catch {}
@@ -77,7 +79,13 @@ let channelAccounts = loadChannelAccounts();
 
 function resolveProfile(channelKey) {
   if (!channelKey) return channelAccounts.profiles?.default ?? null;
-  const profileName = channelAccounts.channels?.[channelKey] || "default";
+  // Try exact match first; then strip thread suffix so thread sessions inherit channel profile.
+  let profileName = channelAccounts.channels?.[channelKey];
+  if (!profileName) {
+    const parentKey = channelKey.replace(/:thread:\d+$/, "");
+    if (parentKey !== channelKey) profileName = channelAccounts.channels?.[parentKey];
+  }
+  profileName = profileName || "default";
   return channelAccounts.profiles?.[profileName] ?? channelAccounts.profiles?.default ?? null;
 }
 
@@ -202,6 +210,8 @@ const ASK_MODE_ARGS = [
 const ASK_MODE_FILE = `${process.env.HOME}/.local/state/jarvis-voice/channel-ask-mode.json`;
 function _channelIsInAskMode(channelKey) {
   if (!channelKey) return false;
+  // Task agents are never in ask mode — they run autonomously
+  if (channelKey.startsWith("task-agent:")) return false;
   let state;
   try { state = JSON.parse(fs.readFileSync(ASK_MODE_FILE, "utf8")); } catch { return false; }
   // channelKey format: "agent:main:discord:channel:<id>[:thread:<tid>]"
@@ -224,6 +234,8 @@ const MCP_CONFIG_PATH = process.env.JARVIS_MCP_CONFIG_PATH ||
                         `${process.env.HOME}/.config/jarvis-voice/jarvis-mcp.json`;
 function _channelMcpMode(channelKey) {
   if (!channelKey) return { mode: "off" };
+  // Task agents always get full MCP — they need tools to complete their work
+  if (channelKey.startsWith("task-agent:")) return { mode: "full" };
   let state;
   try { state = JSON.parse(fs.readFileSync(MCP_MODE_FILE, "utf8")); } catch { return { mode: "off" }; }
   const m = channelKey.match(/discord:channel:(\d+)(?::thread:(\d+))?/);
@@ -742,6 +754,7 @@ async function postDiscordMessage(channelId, content) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ content: chunk }),
+      signal: AbortSignal.timeout(10_000), // 10s timeout — prevents hanging if Discord API is slow
     });
     if (!response.ok) {
       const body = await response.text();
@@ -777,6 +790,9 @@ async function storeMemory(content, category = "global") {
 
 async function postSpeakSummary(message, taskId) {
   if (!ALERT_WEBHOOK_TOKEN || !message) return;
+  // Timeout prevents hanging if jarvis-voice is unresponsive (OOM, restart, etc.)
+  // A failed /speak callback means the task won't get its result delivered, but at least
+  // the gateway doesn't hang indefinitely blocking the entire microtask chain.
   await fetch(SPEAK_URL, {
     method: "POST",
     headers: {
@@ -784,6 +800,7 @@ async function postSpeakSummary(message, taskId) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ message, source: "task-progress", taskId }),
+    signal: AbortSignal.timeout(10_000), // 10s timeout — prevents indefinite hangs
   });
 }
 
@@ -1005,8 +1022,303 @@ app.post("/hooks/agent", requireAuth, async (req, res) => {
   });
 });
 
+// ── Task Agent — isolated session, full MCP, no session accumulation ──────────
+// Spawns a fresh Claude session (chatId=null) with MCP via "task-agent:" channelKey.
+// Brain layer calls this for tool-heavy intents to keep the main voice session lean.
+app.post("/v1/task/run", requireAuth, async (req, res) => {
+  metrics.hooksAgent++;
+  const prompt  = String(req.body?.prompt  || "");
+  const model   = req.body?.model ? String(req.body.model) : undefined;
+  const taskId  = req.body?.taskId ? String(req.body.taskId) : null;
+  if (!prompt) return res.status(400).json({ error: "prompt required" });
+  res.status(202).json({ accepted: true, taskId, backend: "jarvis-gateway/task-agent" });
+
+  queueMicrotask(async () => {
+    // Unique per-task key — always fresh session (chatId=null), always full MCP
+    const channelKey = `task-agent:${taskId || Date.now()}`;
+    let result;
+    try {
+      result = await callClaudeAgent(prompt, model, null, channelKey);
+    } catch (error) {
+      log("task_agent_error", { taskId, error: String(error.message || error) });
+      try { await postSpeakSummary("The task could not be completed.", taskId); } catch {}
+      return;
+    }
+    try { await postSpeakSummary(summarize(result.text), taskId); } catch (e) {
+      log("task_agent_speak_error", { taskId, error: String(e.message || e) });
+    }
+    log("task_agent_done", { taskId, model: result.model, chars: result.text?.length });
+  });
+});
+
+// ── Blade TTS audio file route ────────────────────────────────────────────────
+// Serves generated WAV files written by the Blade WS handler.
+// Files are cleaned up automatically 60 s after creation.
+const BLADE_TTS_DIR = "/tmp";
+app.get("/v1/blade/tts/:id", requireAuth, (req, res) => {
+  const id = String(req.params.id || "").replace(/[^a-zA-Z0-9-]/g, "");
+  const filePath = `${BLADE_TTS_DIR}/blade-tts-${id}.wav`;
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "TTS file not found or expired" });
+  }
+  res.setHeader("Content-Type", "audio/wav");
+  fs.createReadStream(filePath).pipe(res);
+});
+
 app.use((_req, res) => {
   res.status(405).json({ error: "Unsupported route" });
+});
+
+// ── Vuzix Blade 2 WebSocket relay ─────────────────────────────────────────────
+// Path: ws://host:22100/v1/blade
+// Auth: Bearer token (JARVIS_GATEWAY_TOKEN), same as HTTP routes.
+// Frames are JSON objects in both directions.
+//
+// Inbound frame types (Blade → gateway):
+//   { type: "prompt",      text: string }   — run a new Claude turn
+//   { type: "stop" }                        — abort the active claude process
+//   { type: "new-session" }                 — rotate to a fresh Claude session
+//   { type: "approve" }                     — confirm a pending approval prompt
+//   { type: "deny" }                        — reject a pending approval prompt
+//
+// Outbound frame types (gateway → Blade):
+//   { type: "token",    text: string }      — streaming partial text delta
+//   { type: "done",     fullText: string }  — stream finished; fullText = everything
+//   { type: "approval", prompt: string }    — paused, awaiting approve/deny
+//   { type: "error",    message: string }   — something went wrong
+//   { type: "tts",      url: string }       — TTS audio available at this GET URL
+
+// ANSI escape code stripper (blade display has no ANSI rendering)
+const ANSI_RE = /[][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]/g;
+function stripAnsiForBlade(str) {
+  return String(str || "").replace(ANSI_RE, "");
+}
+
+// Approval-prompt detector — patterns that claude uses when it needs confirmation
+const APPROVAL_RE = /\[Y\/n\]|Approve\?|allow|deny|yes\/no|\(y\/N\)/i;
+
+const bladeWss = new WebSocketServer({ noServer: true });
+
+bladeWss.on("connection", (ws, req) => {
+  // ── Auth ─────────────────────────────────────────────────────────────────
+  if (GATEWAY_TOKEN) {
+    const auth = req.headers.authorization || "";
+    if (auth !== `Bearer ${GATEWAY_TOKEN}`) {
+      ws.close(4001, "Unauthorized");
+      return;
+    }
+  }
+
+  // ── Per-connection state ─────────────────────────────────────────────────
+  const channelKey = `agent:main:blade:session:${crypto.randomUUID()}`;
+  let chatId = null;        // resolved after first getOrCreateChatId
+  let activeChild = null;   // current claude subprocess (if streaming)
+  let approved = null;      // null=not waiting, true=approved, false=denied
+  let approvalResolve = null; // resolve fn for the in-flight approval promise
+
+  // Warm the session immediately on connect
+  getOrCreateChatId(channelKey).then(id => { chatId = id; }).catch(() => {});
+
+  log("blade_connected", { channelKey });
+
+  function send(frame) {
+    if (ws.readyState === ws.OPEN) {
+      try { ws.send(JSON.stringify(frame)); } catch (e) {
+        log("blade_send_error", { channelKey, error: e.message });
+      }
+    }
+  }
+
+  // ── Inbound message handler ──────────────────────────────────────────────
+  ws.on("message", async (raw) => {
+    let frame;
+    try { frame = JSON.parse(String(raw)); } catch {
+      send({ type: "error", message: "invalid JSON frame" });
+      return;
+    }
+
+    // ── approve / deny — resolve in-flight approval gate ──────────────────
+    if (frame.type === "approve" || frame.type === "deny") {
+      approved = frame.type === "approve";
+      if (approvalResolve) { approvalResolve(approved); approvalResolve = null; }
+      return;
+    }
+
+    // ── stop — kill active process ────────────────────────────────────────
+    if (frame.type === "stop") {
+      if (activeChild) {
+        try { activeChild.kill("SIGTERM"); } catch {}
+        setTimeout(() => { try { activeChild?.kill("SIGKILL"); } catch {} }, 2_000).unref();
+        activeChild = null;
+      }
+      return;
+    }
+
+    // ── new-session — rotate Claude session ───────────────────────────────
+    if (frame.type === "new-session") {
+      if (activeChild) {
+        try { activeChild.kill("SIGTERM"); } catch {}
+        activeChild = null;
+      }
+      channelSessions.delete(channelKey);
+      channelTurns.delete(channelKey);
+      channelCreatedAt.delete(channelKey);
+      saveSessions(); saveTurns(); saveCreatedAt();
+      chatId = null;
+      await getOrCreateChatId(channelKey).then(id => { chatId = id; }).catch(() => {});
+      send({ type: "token", text: "[session rotated]\n" });
+      return;
+    }
+
+    // ── prompt — run a claude turn ────────────────────────────────────────
+    if (frame.type === "prompt") {
+      const promptText = String(frame.text || "").trim();
+      if (!promptText) { send({ type: "error", message: "empty prompt" }); return; }
+      if (activeChild) { send({ type: "error", message: "busy — send stop first" }); return; }
+
+      // Resolve chatId if not yet warmed
+      if (chatId === null) {
+        try { chatId = await getOrCreateChatId(channelKey); } catch (e) {
+          send({ type: "error", message: `session error: ${e.message}` });
+          return;
+        }
+      }
+
+      const model = DEFAULT_CLAUDE_MODEL;
+      let child;
+      try {
+        child = spawnClaudeStream(promptText, model, chatId, channelKey, null);
+      } catch (e) {
+        send({ type: "error", message: `spawn failed: ${e.message}` });
+        return;
+      }
+      activeChild = child;
+
+      let lineBuf = "";
+      let fullText = "";
+      let resolvedSessionId = chatId;
+      let lastTextLen = 0;
+      approved = null;
+      approvalResolve = null;
+
+      child.stdout.on("data", async (chunk) => {
+        lineBuf += chunk.toString();
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop(); // hold incomplete last line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let ev;
+          try { ev = JSON.parse(line); } catch { continue; }
+
+          if (ev.session_id) resolvedSessionId = ev.session_id;
+
+          if (ev.type === "assistant") {
+            const textBlock = (ev.message?.content ?? []).find(b => b.type === "text");
+            const text = textBlock?.text ?? "";
+            if (text.length > lastTextLen) {
+              const delta = stripAnsiForBlade(text.slice(lastTextLen));
+              lastTextLen = text.length;
+              fullText += delta;
+              send({ type: "token", text: delta });
+
+              // Scan for approval patterns in the new delta
+              if (APPROVAL_RE.test(delta)) {
+                const lines = delta.split("\n").filter(Boolean);
+                const lastLine = lines[lines.length - 1] || delta.trim();
+                send({ type: "approval", prompt: lastLine });
+                // Pause: wait for approve/deny frame (or WS close)
+                const userApproval = await new Promise((resolve) => {
+                  approvalResolve = resolve;
+                  // Auto-deny if WS closes while waiting
+                  ws.once("close", () => resolve(false));
+                });
+                if (!userApproval) {
+                  // User denied — kill the claude process
+                  try { child.kill("SIGTERM"); } catch {}
+                  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2_000).unref();
+                }
+              }
+            }
+          }
+
+          if (ev.type === "result" && ev.is_error) {
+            send({ type: "error", message: ev.result || "claude stream error" });
+            try { child.kill("SIGTERM"); } catch {}
+          }
+        }
+      });
+
+      child.stderr.on("data", () => {}); // swallow stderr
+
+      child.on("close", async (code) => {
+        activeChild = null;
+        if (lineBuf.trim()) {
+          // Flush any partial line
+          let ev;
+          try { ev = JSON.parse(lineBuf); } catch { ev = null; }
+          if (ev?.session_id) resolvedSessionId = ev.session_id;
+        }
+
+        // Persist session
+        if (resolvedSessionId) setSession(channelKey, resolvedSessionId);
+        chatId = resolvedSessionId;
+
+        const summary = fullText.trim() ? summarize(fullText) : "";
+        send({ type: "done", fullText });
+
+        // TTS — write summary to a temp WAV file via postSpeakSummary (fire-and-forget)
+        // postSpeakSummary only POSTs to piper-server (speaks on local speakers);
+        // we also expose the audio if piper-server returns a file path.
+        // Since postSpeakSummary doesn't return a file path, we generate a unique ID
+        // for the TTS URL and serve it if the piper-server wrote a file there.
+        if (summary) {
+          const ttsId = crypto.randomUUID();
+          const ttsPath = `${BLADE_TTS_DIR}/blade-tts-${ttsId}.wav`;
+
+          // Best-effort: trigger speak (fire-and-forget, no await blocking WS response)
+          postSpeakSummary(summary, null).catch(() => {});
+
+          // If piper-server also saves to ttsPath (configured externally), expose the URL.
+          // Auto-cleanup after 60 s regardless.
+          const cleanupTimer = setTimeout(() => {
+            fs.unlink(ttsPath, () => {});
+          }, 60_000);
+          cleanupTimer.unref();
+
+          send({ type: "tts", url: `/v1/blade/tts/${ttsId}` });
+        }
+
+        if (code !== 0 && code !== null) {
+          log("blade_claude_exit_error", { channelKey, code });
+        }
+      });
+
+      child.on("error", (err) => {
+        activeChild = null;
+        send({ type: "error", message: `process error: ${err.message}` });
+      });
+
+      return;
+    }
+
+    send({ type: "error", message: `unknown frame type: ${frame.type}` });
+  });
+
+  ws.on("close", () => {
+    log("blade_disconnected", { channelKey });
+    if (activeChild) {
+      try { activeChild.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { activeChild?.kill("SIGKILL"); } catch {} }, 2_000).unref();
+      activeChild = null;
+    }
+    // Resolve any pending approval gate so streaming stops
+    if (approvalResolve) { approvalResolve(false); approvalResolve = null; }
+  });
+
+  ws.on("error", (err) => {
+    log("blade_ws_error", { channelKey, error: err.message });
+  });
 });
 
 // ── Graceful shutdown — drain in-flight cursor-agent children before exiting ──
@@ -1044,7 +1356,7 @@ function validateStartup() {
 }
 validateStartup();
 
-const server = app.listen(PORT, "127.0.0.1", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   const profileStats = validateProfiles();
   log("startup", {
     port: PORT,
@@ -1054,4 +1366,14 @@ const server = app.listen(PORT, "127.0.0.1", () => {
     sessionStore: SESSION_STORE_PATH,
     profiles_loaded: profileStats,
   });
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/v1/blade") {
+    bladeWss.handleUpgrade(req, socket, head, (ws) => {
+      bladeWss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
 });

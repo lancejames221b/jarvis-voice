@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 // ── Mocks must be declared before imports ────────────────────────────
 vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-vi.mock('../shortcut-engine.js', () => ({
+vi.mock('../discord/shortcut-engine.js', () => ({
   tryShortcut: vi.fn(async () => ({ handled: false })),
 }));
 
@@ -25,23 +25,23 @@ vi.mock('../visual-mode.js', () => ({
   setVisualTargetChannel: vi.fn(() => true),
 }));
 
-vi.mock('../tts-toggle.js', () => ({
+vi.mock('../voice/tts-toggle.js', () => ({
   isTtsToggleCommand: vi.fn(() => null),
   setTtsProvider: vi.fn(() => ({ ok: true, provider: 'edge' })),
 }));
 
-vi.mock('../intent-classifier.js', () => ({
+vi.mock('../brain/intent-classifier.js', () => ({
   shouldDismiss: vi.fn(() => ({ dismiss: false })),
   isSideTalk: vi.fn(() => false),
 }));
 
-vi.mock('../brain.js', () => ({
+vi.mock('../brain/brain.js', () => ({
   switchPersona: vi.fn((name) => ({ name, voice: 'edge', wakeWords: [] })),
   listPersonalities: vi.fn(() => ['jarvis', 'snoop', 'alfred']),
   getActivePersona: vi.fn(() => ({ name: 'jarvis' })),
 }));
 
-vi.mock('../focus-state.js', () => ({
+vi.mock('../state/focus-state.js', () => ({
   setFocusByName: vi.fn(() => null),
   setFocusWithThread: vi.fn(async () => null),
   clearFocus: vi.fn(),
@@ -52,31 +52,36 @@ vi.mock('../focus-state.js', () => ({
   ]),
 }));
 
-vi.mock('../channel-router.js', () => ({
+vi.mock('../discord/channel-router.js', () => ({
   detectChannelCommand: vi.fn(() => ({ action: null, target: null, raw: '' })),
 }));
 
-vi.mock('../fuzzy-dispatch.js', () => ({
+vi.mock('../discord/fuzzy-dispatch.js', () => ({
   fuzzyMatch: vi.fn(() => ({ matched: false })),
 }));
 
-vi.mock('../haiku-intent.js', () => ({
+vi.mock('../brain/haiku-intent.js', () => ({
   classifyIntent: vi.fn(async () => null),
 }));
 
+vi.mock('../kanban-dispatch.js', () => ({
+  tryKanbanDispatch: vi.fn(async () => ({ handled: false })),
+}));
+
 // Import after all mocks
-import { dispatchCommand, isInterruptCommand } from '../command-dispatch.js';
+import { dispatchCommand, isInterruptCommand } from '../discord/command-dispatch.js';
 import * as tldrMode from '../tldr-mode.js';
 import * as mobileMode from '../mobile-mode.js';
 import * as visualMode from '../visual-mode.js';
-import * as ttsToggle from '../tts-toggle.js';
-import * as intentClassifier from '../intent-classifier.js';
-import * as brain from '../brain.js';
-import * as focusState from '../focus-state.js';
-import * as channelRouter from '../channel-router.js';
-import * as shortcutEngine from '../shortcut-engine.js';
-import * as fuzzyDispatch from '../fuzzy-dispatch.js';
-import * as haikuIntent from '../haiku-intent.js';
+import * as ttsToggle from '../voice/tts-toggle.js';
+import * as intentClassifier from '../brain/intent-classifier.js';
+import * as brain from '../brain/brain.js';
+import * as focusState from '../state/focus-state.js';
+import * as channelRouter from '../discord/channel-router.js';
+import * as shortcutEngine from '../discord/shortcut-engine.js';
+import * as fuzzyDispatch from '../discord/fuzzy-dispatch.js';
+import * as haikuIntent from '../brain/haiku-intent.js';
+import * as kanbanDispatch from '../kanban-dispatch.js';
 
 // ── Test helpers ────────────────────────────────────────────────────
 const ADMIN_ID = 'user-admin';
@@ -107,6 +112,7 @@ describe('command-dispatch.js', () => {
     shortcutEngine.tryShortcut.mockResolvedValue({ handled: false });
     fuzzyDispatch.fuzzyMatch.mockReturnValue({ matched: false });
     haikuIntent.classifyIntent.mockResolvedValue(null);
+    kanbanDispatch.tryKanbanDispatch.mockResolvedValue({ handled: false });
   });
 
   // ── isInterruptCommand ────────────────────────────────────────────
@@ -372,6 +378,66 @@ describe('command-dispatch.js', () => {
       const result = await dispatchCommand('cancel enroll', 'cancel enroll', ADMIN_ID, ALLOWED_USERS, enrollState);
       expect(result.type).toBe('enrollment');
       expect(result.action).toBe('cancel');
+    });
+  });
+
+  // ── Kanban dispatch wiring ────────────────────────────────────────
+  describe('kanban dispatch', () => {
+    const KANBAN_CHAN = 'chan-kanban-1';
+
+    it('passes channelId to tryKanbanDispatch', async () => {
+      await dispatchCommand('whatever', 'whatever', ADMIN_ID, ALLOWED_USERS, ENROLLMENT_STATE, KANBAN_CHAN);
+      expect(kanbanDispatch.tryKanbanDispatch).toHaveBeenCalledWith('whatever', KANBAN_CHAN);
+    });
+
+    it('does not call tryKanbanDispatch when channelId is null', async () => {
+      await dispatch('whatever', 'whatever');
+      expect(kanbanDispatch.tryKanbanDispatch).not.toHaveBeenCalled();
+    });
+
+    it('handled kanban result → type: kanban with speech and discordText', async () => {
+      kanbanDispatch.tryKanbanDispatch.mockResolvedValue({
+        handled: true,
+        result: '✅ Task created: fix login [abc12]',
+        voice: 'Created task: fix login',
+      });
+      const result = await dispatchCommand(
+        'create a task: fix login',
+        'create a task: fix login',
+        ADMIN_ID,
+        ALLOWED_USERS,
+        ENROLLMENT_STATE,
+        KANBAN_CHAN,
+      );
+      expect(result.type).toBe('kanban');
+      expect(result.speech).toBe('Created task: fix login');
+      expect(result.discordText).toBe('✅ Task created: fix login [abc12]');
+    });
+
+    it('unhandled kanban result → falls through to brain', async () => {
+      kanbanDispatch.tryKanbanDispatch.mockResolvedValue({ handled: false });
+      const result = await dispatchCommand(
+        'what is the weather',
+        'what is the weather',
+        ADMIN_ID,
+        ALLOWED_USERS,
+        ENROLLMENT_STATE,
+        KANBAN_CHAN,
+      );
+      expect(result.type).toBe('brain');
+    });
+
+    it('kanban dispatch error → falls through to brain (does not throw)', async () => {
+      kanbanDispatch.tryKanbanDispatch.mockRejectedValue(new Error('boom'));
+      const result = await dispatchCommand(
+        'show the board',
+        'show the board',
+        ADMIN_ID,
+        ALLOWED_USERS,
+        ENROLLMENT_STATE,
+        KANBAN_CHAN,
+      );
+      expect(result.type).toBe('brain');
     });
   });
 

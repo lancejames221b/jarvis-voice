@@ -14,3 +14,9 @@ config-backups/
 
 # Local env backups
 .env.backups/
+.gstack/
+.env.bak
+.env.bak.*
+*.env.bak
+.claude/worktrees/
+.claude/scheduled_tasks.lock

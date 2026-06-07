@@ -33,7 +33,7 @@ const COMPLETIONS_URL = `${GATEWAY_URL}/v1/chat/completions`;
 
 // Model: Haiku for speed. ~500ms for a classification call.
 const CLASSIFIER_MODEL = process.env.HAIKU_INTENT_MODEL || 'jamesgroup/claude-haiku-4-5';
-const CLASSIFIER_TIMEOUT_MS = parseInt(process.env.HAIKU_INTENT_TIMEOUT_MS || '1500');
+const CLASSIFIER_TIMEOUT_MS = parseInt(process.env.HAIKU_INTENT_TIMEOUT_MS || '4500');
 
 // Build channel vocabulary from registry (refreshed on each call — registry can change)
 function buildVocabulary() {
@@ -146,6 +146,18 @@ INTENTS:
 
 14. not_command — this is NOT a structured command. It's a question, request, conversation, or task.
     Use this for anything that doesn't clearly match the above intents.
+
+15. calendar_create — user wants to CREATE a new calendar event (not look one up).
+    Triggers: "schedule a meeting with <person>", "book <person> for <time>",
+              "create an event called <X> at <time>", "put <event> on my calendar at <time>",
+              "set up a call with <person> tomorrow at <time>", "add <event> to my calendar"
+    Distinguish from calendar_query: query asks "is <person> free / what's on / who's busy",
+    create says "schedule / book / add / put on calendar / set up".
+    Params: { title: "<event title, infer from context if not stated>",
+              attendees: ["<name1>", "<name2>"] (lowercase first names or emails, [] if solo),
+              start: "<natural language or ISO 8601, e.g. 'tomorrow 2pm' or '2026-05-28T14:00:00-04:00'>",
+              durationMin: <integer minutes, default 30 if not stated>,
+              description: "<optional notes from the utterance, or null>" }
 
 IMPORTANT:
 - When in doubt, return not_command. False positives are worse than false negatives.

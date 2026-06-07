@@ -3,7 +3,7 @@
  *
  * On voice join, gathers:
  *   1. Trello: "3 Commits" cards + current task
- *   2. Calendar events (next 2 hours) via OpenClaw gateway
+ *   2. Calendar events (next 2 hours) via Jarvis gateway
  *   3. Current focus channel
  *
  * Synthesizes a ~20-second spoken briefing and plays it after the "online" greeting.
@@ -20,7 +20,7 @@
  */
 
 import logger from './logger.js';
-import { getFocus, isFocusFresh } from './focus-state.js';
+import { getFocus, isFocusFresh } from './state/focus-state.js';
 import { getTodayEvents } from './calendar-cache.js';
 
 // Master toggle
@@ -150,7 +150,7 @@ async function _silentOpenSurfaces() {
   const focus = getFocus();
   if (focus && focus.channelId) {
     // Discord channel URL
-    const guildId = process.env.GUILD_ID || '1469077140116078750';
+    const guildId = process.env.GUILD_ID || '';
     urls.push(`https://discord.com/channels/${guildId}/${focus.channelId}`);
   }
 

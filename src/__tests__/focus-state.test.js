@@ -16,36 +16,49 @@ vi.mock('util', () => ({
 
 vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-// Sample registry for tests
+// Sample registry for tests — FLAT format (keyed by channelId, no channels wrapper)
 const SAMPLE_REGISTRY = {
-  channels: {
-    'chan-gibson': {
-      name: 'gibson',
-      aliases: ['gibson-main', 'gib'],
-      purpose: 'Gibson AI project',
-      project: { name: 'Gibson', repo: 'unit221b/gibson', branch: 'main' },
-      currentFocus: 'Working on beta launch',
-      todos: ['Review PR', 'Update docs'],
-      mcpTools: ['notion-oauth', 'linear'],
-    },
-    'chan-ewitness': {
-      name: 'ewitness-engineering',
-      aliases: ['ewitness', 'ew-api'],
-      purpose: 'eWitness engineering channel',
-      project: { name: 'eWitness' },
-      currentFocus: null,
-      todos: [],
-      mcpTools: [],
-    },
-    'chan-jarvis-voice': {
-      name: 'jarvis-voice-dev',
-      aliases: ['jarvis voice', 'voice dev'],
-      purpose: 'Jarvis voice bot development',
-      project: { name: 'Jarvis Voice' },
-      currentFocus: null,
-      todos: [],
-      mcpTools: [],
-    },
+  'chan-gibson': {
+    name: 'gibson',
+    aliases: ['gibson-main', 'gib'],
+    purpose: 'Gibson AI project',
+    project: { name: 'Gibson', repo: 'unit221b/gibson', branch: 'main' },
+    currentFocus: 'Working on beta launch',
+    todos: ['Review PR', 'Update docs'],
+    mcpTools: ['notion-oauth', 'linear'],
+    path: '~/Dev/gibson',
+    kanbanEnabled: true,
+    kanbanPath: '~/Dev/gibson',
+  },
+  'chan-ewitness': {
+    name: 'ewitness-engineering',
+    aliases: ['ewitness', 'ew-api'],
+    purpose: 'eWitness engineering channel',
+    project: { name: 'eWitness' },
+    currentFocus: null,
+    todos: [],
+    mcpTools: [],
+    path: '~/Dev/ewitness',
+    kanbanEnabled: true,
+  },
+  'chan-jarvis-voice': {
+    name: 'jarvis-voice-dev',
+    aliases: ['jarvis voice', 'voice dev'],
+    purpose: 'Jarvis voice bot development',
+    project: { name: 'Jarvis Voice' },
+    currentFocus: null,
+    todos: [],
+    mcpTools: [],
+  },
+  'chan-worktree': {
+    name: 'ewitness-dev',
+    purpose: 'eWitness worktree channel',
+    directory: '/home/user/Dev/ewitness',
+    model: 'claude-sonnet-4-6',
+    projectPath: '/home/user/Dev/ewitness',
+    baseRef: 'main',
+    worktreeMode: 'per-thread',
+    worktreeRoot: '/home/user/dev/worktrees',
   },
 };
 
@@ -88,7 +101,7 @@ describe('focus-state.js', () => {
     }));
     vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
-    focusStateModule = await import('../focus-state.js');
+    focusStateModule = await import('../state/focus-state.js');
 
     // Reapply mock implementation after module reload
     const { readFileSync: rfs, writeFileSync: wfs } = await import('fs');
@@ -305,7 +318,7 @@ describe('focus-state.js', () => {
     it('returns all channels from registry', () => {
       const channels = focusStateModule.listChannels();
       expect(Array.isArray(channels)).toBe(true);
-      expect(channels.length).toBe(3); // gibson, ewitness, jarvis-voice-dev
+      expect(channels.length).toBe(4); // gibson, ewitness, jarvis-voice-dev, ewitness-dev
     });
 
     it('each channel has channelId, name, aliases', () => {
@@ -329,6 +342,84 @@ describe('focus-state.js', () => {
       const channels = focusStateModule.listChannels();
       const gibson = channels.find(c => c.name === 'gibson');
       expect(gibson.aliases).toContain('gib');
+    });
+  });
+
+  // ── worktree fields in focus state ──────────────────────────────
+  describe('worktree fields from registry entry', () => {
+    it('setFocusByName includes projectPath when registry entry has it', () => {
+      const result = focusStateModule.setFocusByName('ewitness-dev');
+      expect(result).not.toBeNull();
+      expect(result.projectPath).toBe('/home/user/Dev/ewitness');
+    });
+
+    it('setFocusByName includes worktreeMode when registry entry has it', () => {
+      const result = focusStateModule.setFocusByName('ewitness-dev');
+      expect(result.worktreeMode).toBe('per-thread');
+    });
+
+    it('setFocusByName includes baseRef when registry entry has it', () => {
+      const result = focusStateModule.setFocusByName('ewitness-dev');
+      expect(result.baseRef).toBe('main');
+    });
+
+    it('setFocusByName includes worktreeRoot when registry entry has it', () => {
+      const result = focusStateModule.setFocusByName('ewitness-dev');
+      expect(result.worktreeRoot).toBe('/home/user/dev/worktrees');
+    });
+
+    it('setFocusByName omits worktree fields for channels without worktree config', () => {
+      const result = focusStateModule.setFocusByName('gibson');
+      expect(result).not.toBeNull();
+      // Fields should be undefined or null — not present from a channel with no worktree config
+      expect(result.projectPath == null).toBe(true);
+      expect(result.worktreeMode == null || result.worktreeMode === 'none').toBe(true);
+    });
+
+    it('setFocusById includes worktree fields', () => {
+      const result = focusStateModule.setFocusById('chan-worktree', 'ewitness-dev');
+      expect(result.projectPath).toBe('/home/user/Dev/ewitness');
+      expect(result.worktreeMode).toBe('per-thread');
+      expect(result.baseRef).toBe('main');
+      expect(result.worktreeRoot).toBe('/home/user/dev/worktrees');
+    });
+  });
+
+  // ── isKanbanChannel ───────────────────────────────────────────────
+  describe('isKanbanChannel()', () => {
+    it('returns true when kanbanEnabled is true', () => {
+      expect(focusStateModule.isKanbanChannel('chan-gibson')).toBe(true);
+    });
+
+    it('defaults to false when kanbanEnabled is absent', () => {
+      expect(focusStateModule.isKanbanChannel('chan-jarvis-voice')).toBe(false);
+    });
+
+    it('returns true for a channel with kanbanEnabled true and no kanbanPath', () => {
+      expect(focusStateModule.isKanbanChannel('chan-ewitness')).toBe(true);
+    });
+
+    it('returns false for unknown channel id', () => {
+      expect(focusStateModule.isKanbanChannel('chan-does-not-exist')).toBe(false);
+    });
+  });
+
+  // ── getKanbanPath ────────────────────────────────────────────────
+  describe('getKanbanPath()', () => {
+    it('returns kanbanPath when present', () => {
+      expect(focusStateModule.getKanbanPath('chan-gibson')).toBe('~/Dev/gibson');
+    });
+
+    it('falls back to path field when kanbanPath is absent', () => {
+      expect(focusStateModule.getKanbanPath('chan-ewitness')).toBe('~/Dev/ewitness');
+    });
+
+    it('returns null when neither kanbanPath nor path is present', () => {
+      expect(focusStateModule.getKanbanPath('chan-jarvis-voice')).toBeNull();
+    });
+
+    it('returns null for unknown channel id', () => {
+      expect(focusStateModule.getKanbanPath('chan-does-not-exist')).toBeNull();
     });
   });
 });

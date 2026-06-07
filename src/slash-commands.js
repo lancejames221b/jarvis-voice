@@ -43,6 +43,7 @@ import { handleSkillCommand, listSkills } from './slash/skill.js';
 import { getBox, setBox, listBoxes, getCwd, persistBoxState, BOX_NAMES } from './slash/box-state.js';
 import { isOwner as isChannelOwner, grantAccess, revokeAccess, listAccess } from './channel-access.js';
 import { handleSessionCommand, startSessionDirect, buildResumeCommand } from './slash/session.js';
+import { LOOP_CMD, handleLoopCommand, stopLoop, isLoopRunning } from './slash/loop.js';
 import { findProjectMapByName } from './slash/project-map.js';
 import logger from './logger.js';
 
@@ -333,9 +334,9 @@ export async function registerSlashCommands(client) {
     }
     await rest.put(
       Routes.applicationGuildCommands(client.user.id, guildId),
-      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON()] }
+      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON(), LOOP_CMD.toJSON()] }
     );
-    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos commands');
+    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos, /loop commands');
   } catch (err) {
     logger.error(`[slash] Failed to register commands: ${err.message}`);
   }
@@ -389,9 +390,24 @@ export async function handleSlashCommand(interaction, allowedUsers) {
     return true;
   }
 
+  if (interaction.commandName === 'loop') {
+    if (!isChannelOwner(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true });
+      return true;
+    }
+    await handleLoopCommand(interaction);
+    return true;
+  }
+
   if (interaction.commandName === 'stop') {
     if (!isChannelOwner(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true });
+      return true;
+    }
+    // If a loop is running in this thread, stop it first.
+    if (isLoopRunning(interaction.channelId)) {
+      stopLoop(interaction.channelId);
+      await interaction.reply('🛑 Loop stopped.');
       return true;
     }
     await handleStopCommand(interaction);

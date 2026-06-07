@@ -626,7 +626,7 @@ export async function generateResponseStreaming(userMessage, history = [], signa
         body: JSON.stringify({
           messages,
           max_tokens: 8192,
-          user: getActiveSessionUser(),
+          user: options.sessionUser || getActiveSessionUser(),
           stream: false,
           model: activeModel,
           ...THINKING_PARAM,
@@ -700,7 +700,7 @@ export async function generateResponseStreaming(userMessage, history = [], signa
       body: JSON.stringify({
         messages,
         max_tokens: 8192,
-        user: getActiveSessionUser(),
+        user: options.sessionUser || getActiveSessionUser(),
         stream: true,
         model: activeModel,
         ...THINKING_PARAM,
@@ -979,7 +979,7 @@ export async function generateResponse(userMessage, history = [], signal, option
       body: JSON.stringify({
         messages,
         max_tokens: 8192,
-        user: getActiveSessionUser(),
+        user: options.sessionUser || getActiveSessionUser(),
         model: voiceModel,
         ...THINKING_PARAM,
       }),
@@ -1392,7 +1392,12 @@ Replace YOUR_TLDR_HERE with a brief spoken summary (escaped for JSON).
 3. ARTIFACT TRACKING (MANDATORY if you created/modified files or committed code):
 Store a record of what was written and where so other sessions can find it:
 mcporter call haivemind.store_memory content="ARTIFACT [timestamp]: files=[list every file path created/modified] | repo=[repo path] | commit=[hash if committed] | branch=[branch] | summary=[what was built]" category="operations"
-Never skip this step. The voice session cannot see your filesystem — this is the only way to track code artifacts across sessions.`;
+Never skip this step. The voice session cannot see your filesystem — this is the only way to track code artifacts across sessions.
+
+MONITORING / LOOPING (do NOT roll your own poller):
+If the user asks you to monitor something, poll/check repeatedly, keep an eye on a long job, or continue when it finishes, do NOT write a detached background script (no "while true; sleep; done" bash, no nohup, no standalone cron job). Those run invisibly, leave orphan processes, and the user cannot see or stop them from Discord.
+Instead, do ONE check now, report the current state, and then say plainly that the user can run a visible, stoppable loop with: the /loop slash command, or by saying "monitor it every N minutes" / "keep checking until it's done" in this channel — both are handled by the app's loop+schedule engine, post each iteration into the thread, and stop with "stop loop" or /stop. Recommend that instead of building your own monitor. If you genuinely cannot use those (e.g. you need sub-second polling), say so explicitly rather than spawning a hidden process.
+If a prompt you receive begins with "[AUTONOMOUS LOOP" you are ALREADY inside that loop engine — do exactly one unit of work and end your reply with the required STATUS line (STATUS: WORKING | STATUS: BLOCKED <reason> | STATUS: DONE). Never start your own poller from inside a loop turn; the engine calls you again. If you're stuck on something only the user can resolve, say STATUS: BLOCKED <reason> — an honest block beats a fake "done".`;
 
   try {
     const res = await fetch(HOOKS_AGENT_URL, {

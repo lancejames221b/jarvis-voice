@@ -11,11 +11,11 @@
 
 import express from 'express';
 import { queueAlert, getPendingAlerts, clearAlerts } from './alert-queue.js';
-import { markCompleted, getActiveTasks, getLedgerStats } from './task-ledger.js';
-import { hudTaskUpdate } from './hud.js';
+import { markCompleted, getActiveTasks, getLedgerStats } from './agent/task-ledger.js';
+import { hudTaskUpdate } from './discord/hud.js';
 import { setActiveAlert } from './alert-context.js';
-import { getState, transition, canDeliverVoiceAlert, classifyAlertPriority } from './bot-state.js';
-import { setFocusById } from './focus-state.js';
+import { getState, transition, canDeliverVoiceAlert, classifyAlertPriority } from './state/bot-state.js';
+import { setFocusById } from './state/focus-state.js';
 import logger from './logger.js';
 import { isVisualModeEnabled, getVisualTargetChannel } from './visual-mode.js';
 
@@ -25,6 +25,19 @@ app.use(express.json({ limit: '50kb' })); // Larger limit for cron results
 const WEBHOOK_PORT = process.env.ALERT_WEBHOOK_PORT || 3335;
 const WEBHOOK_TOKEN = process.env.ALERT_WEBHOOK_TOKEN || 'change-me';
 const ALERTS_ALSO_POST_TEXT = process.env.ALERTS_ALSO_POST_TEXT !== 'false'; // Mirror all alerts and voice results to text channel
+
+// HUD companion-message preview cap.
+// Discord's hard limit is 2000; default 1900 leaves room for the prefix
+// (`📝 *(voiced)* {source}: `) without exceeding 2000. Override with
+// HUD_VOICED_PREVIEW_CHARS=N in .env to shorten.
+const HUD_VOICED_PREVIEW_CHARS = parseInt(process.env.HUD_VOICED_PREVIEW_CHARS ?? '1900', 10);
+
+function _voicedPreview(text) {
+  if (!text) return '';
+  const s = String(text);
+  if (s.length <= HUD_VOICED_PREVIEW_CHARS) return s;
+  return s.substring(0, Math.max(0, HUD_VOICED_PREVIEW_CHARS - 1)) + '…';
+}
 
 const ESCALATION_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour before escalation
 const ESCALATION_CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
@@ -363,8 +376,8 @@ app.post('/alert', async (req, res) => {
     const src = alert.source ? ` (${alert.source})` : '';
     
     if (alert.source === 'incoming-call') {
-      postToTextCallback(`[${badge}] Alert${src}: ${alert.message}`, { forceChannelId: process.env.HUD_CHANNEL_ID || '1469836132199174299' });
-      postToTextCallback(`[${badge}] Alert${src}: ${alert.message}`, { forceChannelId: '1483474026499149844' });
+      postToTextCallback(`[${badge}] Alert${src}: ${alert.message}`, { forceChannelId: process.env.HUD_CHANNEL_ID });
+      if (process.env.HUD_CHANNEL_ID_2) postToTextCallback(`[${badge}] Alert${src}: ${alert.message}`, { forceChannelId: process.env.HUD_CHANNEL_ID_2 });
     } else {
       postToTextCallback(`[${badge}] Alert${src}: ${alert.message}`);
     }
@@ -620,7 +633,7 @@ app.post('/speak', async (req, res) => {
     // no_ack: total silence. ack_pre: already acked before, nothing after.
     logger.info(`🔇 /speak ON_SCREEN=${onScreenMode} — suppressing voice for screen action`);
     if (postToTextCallback) {
-      postToTextCallback(`📝 *(voiced)* ${source}: ${message.substring(0, 300)}`);
+      postToTextCallback(`📝 *(voiced)* ${source}: ${_voicedPreview(message)}`);
     }
     if (isSubAgentResult && postToThreadCallback) {
       postToThreadCallback(taskId, source, message);
@@ -637,7 +650,7 @@ app.post('/speak', async (req, res) => {
   if (taskAlreadySpoke) {
     logger.info(`🔇 /speak task-progress suppressed — task #${taskId} already spoke inline`);
     if (postToTextCallback) {
-      postToTextCallback(`📝 *(text-only, task spoke inline)* ${message.substring(0, 300)}`);
+      postToTextCallback(`📝 *(text-only, task spoke inline)* ${_voicedPreview(message)}`);
     }
     return res.json({ ok: true, delivered: 'text-only-task-spoke-inline' });
   }
@@ -671,10 +684,10 @@ app.post('/speak', async (req, res) => {
     // When voice is active, text is just a quiet log (no @ping, no bold notification)
     if (ALERTS_ALSO_POST_TEXT && postToTextCallback) {
       if (source === 'incoming-call') {
-        postToTextCallback(`📝 *(voiced)* ${source}: ${message.substring(0, 300)}`, { forceChannelId: process.env.HUD_CHANNEL_ID || '1469836132199174299' });
-        postToTextCallback(`📝 *(voiced)* ${source}: ${message.substring(0, 300)}`, { forceChannelId: '1483474026499149844' });
+        postToTextCallback(`📝 *(voiced)* ${source}: ${_voicedPreview(message)}`, { forceChannelId: process.env.HUD_CHANNEL_ID });
+        if (process.env.HUD_CHANNEL_ID_2) postToTextCallback(`📝 *(voiced)* ${source}: ${_voicedPreview(message)}`, { forceChannelId: process.env.HUD_CHANNEL_ID_2 });
       } else {
-        postToTextCallback(`📝 *(voiced)* ${source || 'result'}: ${message.substring(0, 300)}`);
+        postToTextCallback(`📝 *(voiced)* ${source || 'result'}: ${_voicedPreview(message)}`);
       }
     }
     res.json({ ok: true, delivered: 'voice', userInVoice: true });
@@ -685,8 +698,8 @@ app.post('/speak', async (req, res) => {
       const sourceBadge = source ? `**${source}**` : '**Voice Result**';
       
       if (source === 'incoming-call') {
-        postToTextCallback(`🗣️ ${sourceBadge}: ${message}`, { forceChannelId: process.env.HUD_CHANNEL_ID || '1469836132199174299' });
-        postToTextCallback(`🗣️ ${sourceBadge}: ${message}`, { forceChannelId: '1483474026499149844' });
+        postToTextCallback(`🗣️ ${sourceBadge}: ${message}`, { forceChannelId: process.env.HUD_CHANNEL_ID || '' });
+        if (process.env.HUD_CHANNEL_ID_2) postToTextCallback(`🗣️ ${sourceBadge}: ${message}`, { forceChannelId: process.env.HUD_CHANNEL_ID_2 });
       } else {
         postToTextCallback(`🗣️ ${sourceBadge}: ${message}`);
       }
@@ -758,7 +771,7 @@ app.post('/stop', async (req, res) => {
   if (authHeader !== `Bearer ${WEBHOOK_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
   try {
     // Import and stop speech output if available
-    const { stopSpeaking } = await import('./speech-output.js').catch(() => ({}));
+    const { stopSpeaking } = await import('./voice/speech-output.js').catch(() => ({}));
     if (typeof stopSpeaking === 'function') {
       await stopSpeaking();
       logger.info('🛑 /stop: TTS halted via button');
@@ -841,7 +854,7 @@ app.post('/sleep_mode', async (req, res) => {
   transition('ACTIVE', 'api-request');
   // Restart idle/sleep timers so bot auto-sleeps again if voice goes quiet
   try {
-    const { resetIdleSleepTimer } = await import('./fsm.js').catch(() => ({}));
+    const { resetIdleSleepTimer } = await import('./state/fsm.js').catch(() => ({}));
     if (typeof resetIdleSleepTimer === 'function') resetIdleSleepTimer();
   } catch (_) { /* non-fatal */ }
   logger.info(`⏰ /sleep_mode: transitioned ${previous} → ACTIVE via API`);
@@ -944,7 +957,7 @@ app.get('/personas', async (req, res) => {
   }
 
   try {
-    const { listPersonalities, getActivePersona } = await import('./brain.js');
+    const { listPersonalities, getActivePersona } = await import('./brain/brain.js');
     const all = listPersonalities();
     const active = getActivePersona();
     return res.json({
@@ -968,7 +981,7 @@ app.post('/replay', async (req, res) => {
   const authHeader = req.headers.authorization;
   if (authHeader !== `Bearer ${WEBHOOK_TOKEN}`) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    const { replayLast } = await import('./speech-output.js').catch(() => ({}));
+    const { replayLast } = await import('./voice/speech-output.js').catch(() => ({}));
     if (typeof replayLast === 'function') {
       await replayLast();
       logger.info('▶ /replay: replaying last phrase via button');
@@ -1603,8 +1616,8 @@ app.post('/test-voice', async (req, res) => {
     const pingData = await pingRes.json();
     logger.info(`🧪 direct gateway ping: status=${pingRes.status} ok=${pingRes.ok} body=${JSON.stringify(pingData).substring(0, 120)}`);
 
-    const { generateResponse } = await import('./brain.js');
-    const { speakText } = await import('./speech-output.js');
+    const { generateResponse } = await import('./brain/brain.js');
+    const { speakText } = await import('./voice/speech-output.js');
 
     logger.info(`🧪 /test-voice inject: "${message.substring(0, 80)}"`);
     const startMs = Date.now();

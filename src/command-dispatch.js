@@ -15,6 +15,7 @@ import { switchPersona, listPersonalities, getActivePersona } from './brain.js';
 import { setFocusByName, setFocusWithThread, clearFocus, getFocus, listChannels, refocus, getPreviousFocus } from './focus-state.js';
 import { detectChannelCommand } from './channel-router.js';
 import { fuzzyMatch } from './fuzzy-dispatch.js';
+import { parseScheduleRequest } from './schedule-parse.js';
 import { classifyIntent as haikuClassify } from './haiku-intent.js';
 import { findProjectMapByName } from './slash/project-map.js';
 import { startSessionDirect, buildResumeCommand } from './slash/session.js';
@@ -302,6 +303,26 @@ export async function dispatchCommand(rawTranscript, cleanedTranscript, userId, 
   // We can't call checkWakeWord here without the full pipeline context.
   // Callers must check isSideTalk separately if needed.
 
+  // ── Recurring schedule create (voice-path parity with text @mention, audit 2026-05-27) ──
+  // Matches "monitor it for five minutes", "monitor every minute", "every 5
+  // minutes check the gateway", etc. via the shared schedule-parse module.
+  // The actual createSchedule() call lives in index.js because it needs
+  // message.reply context; this branch just signals the intent + params.
+  {
+    const _schedReq = parseScheduleRequest(cleanedTranscript);
+    if (_schedReq) {
+      return {
+        type: 'schedule_create',
+        prompt: _schedReq.prompt || cleanedTranscript,
+        intervalMs: _schedReq.intervalMs,
+        terminationPhrase: _schedReq.terminationPhrase,
+        maxRuns: _schedReq.maxRuns,
+        model: _schedReq.model,
+        userId,
+      };
+    }
+  }
+
   // ── Shortcut fast-path (bypasses LLM for known commands) ────────────
   const shortcutResult = await tryShortcut(cleanedTranscript, null);
   if (shortcutResult.handled) {
@@ -425,9 +446,13 @@ export async function dispatchCommand(rawTranscript, cleanedTranscript, userId, 
         if (MCP_INTENT_HANDLERS[haikuResult.intent]) {
           try {
             const fetched = await dispatchMcpIntent(haikuResult.intent, haikuResult.params || {});
-            const workspaceContext = fetched
-              ? `${fetched}\n\n[You were asked a question answerable from the data above. Respond conversationally based only on that data. Do not invent details.]`
-              : null;
+            // Action intents (calendar_create etc.) need a different framing
+            // because the work already happened — Claude just confirms.
+            const _isActionIntent = haikuResult.intent === 'calendar_create';
+            const _framing = _isActionIntent
+              ? '\n\n[An action was just performed on the user\'s behalf. The bracketed block above describes what happened. Confirm conversationally in one short sentence. If the action failed, say so plainly without making up a fix.]'
+              : '\n\n[You were asked a question answerable from the data above. Respond conversationally based only on that data. Do not invent details.]';
+            const workspaceContext = fetched ? `${fetched}${_framing}` : null;
             return { type: 'brain', transcript: cleanedTranscript, workspaceContext };
           } catch (err) {
             logger.warn(`[dispatch] MCP intent handler failed: ${err.message}`);
