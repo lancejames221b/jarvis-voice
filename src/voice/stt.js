@@ -802,11 +802,11 @@ async function transcribeWithMLXWhisper(wavPath) {
   }
 }
 
-const LOCAL_WHISPER_URL = process.env.FASTER_WHISPER_URL || 'http://localhost:8766/transcribe';
+const LOCAL_WHISPER_URL = process.env.FASTER_WHISPER_URL || 'http://localhost:8765/transcribe';
 
 /**
  * Transcribe with Faster Whisper using the persistent GPU service.
- * Connects to the Flask server running large-v3 on port 8766.
+ * Connects to the Flask server running large-v3 on port 8765.
  * Returns { text, sttMeta } where sttMeta contains confidence scores.
  */
 async function transcribeWithFasterWhisper(wavPath) {
