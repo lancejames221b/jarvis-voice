@@ -208,11 +208,12 @@ export async function onReady(client, {
         const data = await res.json();
         text = data?.choices?.[0]?.message?.content || '';
       }
-      if (sched.channelId && text) {
-        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: sched.channelId });
+      const _postTargetId = sched.threadId || sched.channelId;
+      if (_postTargetId && text) {
+        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: _postTargetId });
       }
       if (sched.terminationPhrase && text.toLowerCase().includes(sched.terminationPhrase.toLowerCase())) {
-        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: sched.channelId });
+        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: _postTargetId });
       }
       return { text };
     } catch (err) {

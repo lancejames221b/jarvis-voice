@@ -31,6 +31,7 @@ import { classifyAmbient, isAmbientClassifierEnabled } from './brain/haiku-ambie
 import { startAlertWebhook, initAlertWebhook, setCurrentVoiceChannelId, setSpeakCallback, setMarkBotResponseCallback, setPostActivityCallback, setPostToTextCallback, hasPendingHandoffs, getPendingHandoffs, clearHandoffs, updateHealthState, endAllSessionPins, setDedupCallback, setDidTaskSpeakInlineCallback, setPersonaSwitchCallback, setPersonaCreateCallback, recordInlineSpoken, setCancelAllTasksCallback, setHandleFakeSttCallback } from './alert-webhook.js';
 import { createTask, markStreaming, markStreamDone, markWorking, markCompleted as ledgerMarkCompleted, markFailed, markEscalated, isJustAck, reconcileOnStartup, getOrphanedTasks, getPendingFollowups, processOrphans, getTask, TaskState } from './agent/task-ledger.js';
 import { initScheduler, createSchedule, listSchedules, deleteSchedule } from './task-scheduler.js';
+import { parseScheduleRequest } from './schedule-parse.js';
 import { storeTaskToHaivemind, getHaivemindContext, searchHaivemind, getChannelContext, storeChannelMemory } from './agent/session-manager.js';
 import { getTTSHealth } from './voice/tts.js';
 import { getSTTHealth, checkSttHealth } from './voice/stt.js';
@@ -48,6 +49,7 @@ import { getCurrentTtsProvider, getCurrentWakeWord } from './voice/tts-toggle.js
 import { isVerifiedOwner, passesAuthGate, enrollmentState } from './auth.js';
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete } from './slash-commands.js';
 import { handleSessionMessage, isSessionChannel } from './slash/session.js';
+import { detectLoopIntent, startLoopFromMessage, isLoopRunning, stopLoop } from './slash/loop.js';
 import { handleSessionSetup } from './session-setup.js';
 import { canAccessChannel, isOwner as isChannelOwner, OWNER_USER_ID } from './channel-access.js';
 import { setMcpAuthNotify } from './mcp-access.js';
@@ -1411,11 +1413,12 @@ client.once('ready', async () => {
         const data = await res.json();
         text = data?.choices?.[0]?.message?.content || '';
       }
-      if (sched.channelId && text) {
-        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: sched.channelId });
+      const _postTargetId = sched.threadId || sched.channelId;
+      if (_postTargetId && text) {
+        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: _postTargetId });
       }
       if (sched.terminationPhrase && text.toLowerCase().includes(sched.terminationPhrase.toLowerCase())) {
-        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: sched.channelId });
+        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: _postTargetId });
       }
       return { text };
     } catch (err) {
@@ -2131,7 +2134,20 @@ async function buildDiscordContextFromApi(message, limit = 10) {
         const isMe = m.author.bot && m.author.username === myUsername;
         const who = isMe ? 'You (assistant)' : m.author.username;
         const body = (m.content || '').substring(0, 400).replace(/\n/g, ' ');
-        return `${who}: ${body}`;
+        const attachParts = [];
+        if (m.attachments?.size) {
+          for (const a of m.attachments.values()) {
+            const ct = a.contentType?.split(';')[0]?.trim() || '';
+            const ext = a.name?.split('.').pop()?.toLowerCase() || '';
+            const isImage = ct.startsWith('image/') || ['png','jpg','jpeg','gif','webp'].includes(ext);
+            if (ct === 'audio/ogg' || a.url?.endsWith('.ogg')) continue;
+            attachParts.push(isImage
+              ? `[Image attachment: ${a.url}]`
+              : `[file: ${a.name} — ${a.url}]`);
+          }
+        }
+        const suffix = attachParts.length ? (body ? ' ' : '') + attachParts.join(' ') : '';
+        return `${who}: ${body}${suffix}`;
       })
       .join('\n');
 
@@ -2580,52 +2596,42 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
     return { mode: 'llm', shellCmd: null };
   }
 
+  // ── Natural-language "stop loop" — cancel an auto-loop running in this thread ──
+  if (message.channel?.isThread?.() && isLoopRunning(message.channelId)
+      && /\b(stop|cancel|end|kill|halt)\b.{0,15}\bloop(ing)?\b/i.test(content)) {
+    stopLoop(message.channelId);
+    await message.reply('🛑 Loop stopped.');
+    return;
+  }
+
+  // ── Natural-language auto-loop ("keep …ing until done", "loop on X", …) ──
+  // Self-judged with a hard iteration cap, runs in an auto-created thread.
+  // Checked BEFORE the scheduler so "until done" phrasing isn't misrouted;
+  // detectLoopIntent() returns null for fixed-interval "every N" phrasing,
+  // which falls through to the scheduler below.
+  {
+    const _loopIntent = detectLoopIntent(content);
+    if (_loopIntent) {
+      logger.info(`[auto-loop] detected loop intent: "${_loopIntent.prompt.substring(0, 80)}" (model=${_loopIntent.model})`);
+      await startLoopFromMessage(message, _loopIntent, (msg) => message.reply(msg));
+      return;
+    }
+  }
+
   // ── Scheduler intent dispatch (RECURRING_CHECK / LIST_SCHEDULES / DELETE_SCHEDULE) ──
   const _lowerContent = content.toLowerCase();
-  const _isRecurringCheck =
-    /every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/i.test(content) &&
-    /(check|monitor|watch|run|poll|ping|test)\b/i.test(content);
+  const _schedReq = parseScheduleRequest(content);
   const _isListSchedules = /\b(list|show|what)\b.{0,30}\bschedules?\b/i.test(content) ||
     /\bschedules?\s+(are\s+)?(running|active|pending)\b/i.test(content);
   const _isDeleteSchedule = /\b(stop|cancel|remove|delete)\b.{0,30}\bschedule\b/i.test(content);
 
-  if (_isRecurringCheck) {
-    const intervalMatch = content.match(/every\s+(\d+)\s*(second|minute|hour|min|sec|s|m|h)s?/i);
-    let intervalMs = 5 * 60 * 1000;
-    if (intervalMatch) {
-      const n = parseInt(intervalMatch[1]);
-      const unit = intervalMatch[2].toLowerCase();
-      if (unit.startsWith('s')) intervalMs = n * 1000;
-      else if (unit.startsWith('m')) intervalMs = n * 60 * 1000;
-      else if (unit.startsWith('h')) intervalMs = n * 60 * 60 * 1000;
-    }
-    // "until X" — phrase-based termination
-    const untilMatch = content.match(/until\s+(.+?)(?:\.|$)/i);
-    let terminationPhrase = untilMatch ? untilMatch[1].trim() : null;
+  if (_schedReq) {
+    const { intervalMs, maxRuns, terminationPhrase, model: _schedModel, prompt: corePrompt } = _schedReq;
 
-    // "for the next N hours/minutes" — compute maxRuns from total duration
-    let maxRuns = 0;
-    const forMatch = content.match(/for\s+(?:the\s+next\s+)?(\d+)\s*(second|minute|hour|min|sec|s|m|h)s?/i);
-    if (forMatch) {
-      const n = parseInt(forMatch[1]);
-      const u = forMatch[2].toLowerCase();
-      let durationMs;
-      if (u.startsWith('s')) durationMs = n * 1000;
-      else if (u.startsWith('m')) durationMs = n * 60 * 1000;
-      else if (u.startsWith('h')) durationMs = n * 60 * 60 * 1000;
-      maxRuns = Math.max(1, Math.floor(durationMs / intervalMs));
-      // If "until phrase" was something like "until an hour", clear it — duration wins
-      if (terminationPhrase && /^\d+\s*(hour|minute|min|second|sec|h|m|s)/i.test(terminationPhrase)) {
-        terminationPhrase = null;
-      }
-    }
-
-    const corePrompt = content
-      .replace(/every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
-      .replace(/for\s+(?:the\s+next\s+)?\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
-      .replace(/until\s+.+?(?:\.|$)/gi, '')
-      .replace(/^(check|monitor|watch|run|ping|poll)\s+/i, '')
-      .trim();
+    // Post results back to the thread if scheduled from one
+    const _schedIsThread = message.channel?.isThread?.();
+    const _schedParentId = _schedIsThread ? (message.channel.parentId || message.channelId) : message.channelId;
+    const _schedThreadId = _schedIsThread ? message.channelId : null;
 
     // Auto-detect whether this can run as a shell command (no LLM needed)
     const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(corePrompt || content);
@@ -2633,18 +2639,20 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
     const sched = createSchedule({
       prompt: corePrompt || content,
       intervalMs,
-      channelId: message.channelId,
+      channelId: _schedParentId,
+      threadId: _schedThreadId,
       userId: message.author.id,
       terminationPhrase,
       maxRuns,
       mode: _schedMode,
-      model: 'haiku',   // LLM schedules always use haiku
+      model: _schedModel,
       shellCmd: _shellCmd,
     });
     const humanInterval = intervalMs < 60000 ? `${intervalMs/1000}s` : `${intervalMs/60000}m`;
     const suffix = terminationPhrase ? ` until "${terminationPhrase}"` : maxRuns > 0 ? ` (${maxRuns} runs)` : '';
-    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ' 🤖 haiku';
-    await message.reply(`✅ Scheduled — will run every ${humanInterval}${suffix}${modeTag}. ID: \`${sched.id}\``);
+    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ` 🤖 ${_schedModel}`;
+    const threadTag = _schedThreadId ? ' (replies here)' : '';
+    await message.reply(`✅ Scheduled — every ${humanInterval}${suffix}${modeTag}${threadTag}. ID: \`${sched.id}\``);
     return;
   }
 
@@ -4763,6 +4771,45 @@ async function handleSpeech(userId, audioBuffer, preTranscribed = null) {
     }
 
     // ── Kanban dispatch - Kanban-enabled channel handled CLI command ─
+    // ── Voice schedule create — recurring schedule from spoken command ──
+    if (dispatchResult.type === 'schedule_create') {
+      markBotResponse(userId);
+      try {
+        const _postCh = focusChannelId || TEXT_CHANNEL_ID || VOICE_REPORT_CHANNEL_ID;
+        const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(dispatchResult.prompt);
+        const sched = createSchedule({
+          prompt: dispatchResult.prompt,
+          intervalMs: dispatchResult.intervalMs,
+          channelId: _postCh,
+          threadId: null,
+          userId: dispatchResult.userId || userId,
+          terminationPhrase: dispatchResult.terminationPhrase,
+          maxRuns: dispatchResult.maxRuns,
+          mode: _schedMode,
+          model: dispatchResult.model || 'haiku',
+          shellCmd: _shellCmd,
+        });
+        const _secs = Math.round(dispatchResult.intervalMs / 1000);
+        const _human = _secs >= 3600 ? `${Math.round(_secs / 3600)} hours`
+          : _secs >= 60 ? `${Math.round(_secs / 60)} minutes` : `${_secs} seconds`;
+        const _runsNote = dispatchResult.maxRuns > 0 ? `, ${dispatchResult.maxRuns} times` : '';
+        const ack = await synthesizeSpeech(`Scheduled. I'll run that every ${_human}${_runsNote}.`);
+        if (ack) { await playAudioEnhanced(ack); try { unlinkSync(ack); } catch {} }
+        if (_postCh) {
+          fetch(`https://discord.com/api/v10/channels/${_postCh}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${process.env.DISCORD_TOKEN || ''}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: `✅ Scheduled — every ${_human}. ID: \`${sched.id}\`` }),
+          }).catch(() => {});
+        }
+      } catch (err) {
+        logger.error(`[schedule_create voice] failed: ${err.message}`);
+        const errAck = await synthesizeSpeech('Could not set up that schedule.');
+        if (errAck) { await playAudioEnhanced(errAck); try { unlinkSync(errAck); } catch {} }
+      }
+      return;
+    }
+
     if (dispatchResult.type === 'kanban') {
       markBotResponse(userId);
       if (!dispatchResult.silent && dispatchResult.speech) {

@@ -19,3 +19,10 @@ config-backups/
 *.deb
 .claude/scheduled_tasks.json
 .claude/scheduled_tasks.lock
+JarvisBlade/
+.qwen/
+.pi/
+latest.jsonl
+continue.md
+vuzix.md
+plan.md

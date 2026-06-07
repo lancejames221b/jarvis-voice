@@ -1,12 +1,6 @@
-import logger from '../logger.js';
-import { VOICE_NAME } from '../voice/wakeword.js';
-import { getActiveSessionUser, touchActivity, maybeRotateSession, storeTaskToHaivemind, getHaivemindContext, consumeNewSessionFlag, consumeRotatedHistory, getChannelContext, storeChannelMemory } from '../agent/session-manager.js';
-
-function _stripPromptPreamble(prompt) {
-  const marker = '[END BACKGROUND CONTEXT — respond only to the user message below]\n\n';
-  const idx = (prompt || '').indexOf(marker);
-  return idx !== -1 ? prompt.slice(idx + marker.length) : (prompt || '');
-}
+import logger from './logger.js';
+import { VOICE_NAME } from './wakeword.js';
+import { getActiveSessionUser, touchActivity, maybeRotateSession, storeTaskToHaivemind, getHaivemindContext, consumeNewSessionFlag, consumeRotatedHistory, getChannelContext, storeChannelMemory } from './session-manager.js';
 /**
  * Brain Module - Thin voice I/O layer to Jarvis Gateway
  * 
@@ -27,8 +21,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROMPTS_DIR = join(__dirname, '../../prompts');
-const PERSONALITIES_DIR = join(__dirname, '../../personalities');
+const PROMPTS_DIR = join(__dirname, '../prompts');
+const PERSONALITIES_DIR = join(__dirname, '../personalities');
 
 function loadPrompt(filename) {
   try {
@@ -81,7 +75,7 @@ function loadPersonality(name) {
 
 // Active persona — loaded from persisted state file, then VOICE_PERSONA env var, then 'jarvis'
 // Persists last-set persona across restarts so runtime switches survive service bounces.
-const PERSONA_STATE_FILE = join(__dirname, '../..', 'data', 'persona-state.json');
+const PERSONA_STATE_FILE = join(__dirname, '..', 'data', 'persona-state.json');
 
 function loadPersistedPersonaName() {
   try {
@@ -162,7 +156,6 @@ export function getTextModel() { return textModel; }
 export function setTextModel(m) { textModel = m; logger.info(`[model] text model → ${m}`); }
 const _dispatchModel = process.env.DISPATCH_MODEL || process.env.VOICE_MODEL || process.env.DEFAULT_MODEL || 'claude-sonnet-4-6';
 const HOOKS_AGENT_URL = `${GATEWAY_URL}/hooks/agent`;
-const TASK_RUN_URL    = `${GATEWAY_URL}/v1/task/run`;
 const VOICE_CALLBACK_CHANNEL = process.env.VOICE_CALLBACK_CHANNEL_ID || ''; // Set VOICE_CALLBACK_CHANNEL_ID in .env
 
 // ── Thinking param — driven by VOICE_DEFAULT_THINKING env var ───────────
@@ -385,11 +378,11 @@ export function isChannelCircuitOpen(channelKey) {
 
 // Voice tag prepended to messages so the agent formats for TTS
 // Key: use tools exactly as you would in text chat. The ONLY difference is output format.
-import { isMobileModeEnabled } from '../mobile-mode.js';
-import { isVisualModeEnabled } from '../visual-mode.js';
-import { getActiveAlert, clearActiveAlert } from '../alert-context.js';
-import { getFocusContextTag, getFullFocusContext } from '../state/focus-state.js';
-import { getSkillsBlock } from '../skills-loader.js';
+import { isMobileModeEnabled } from './mobile-mode.js';
+import { isVisualModeEnabled } from './visual-mode.js';
+import { getActiveAlert, clearActiveAlert } from './alert-context.js';
+import { getFocusContextTag, getFullFocusContext } from './focus-state.js';
+import { getSkillsBlock } from './skills-loader.js';
 
 // Prompts vars resolved at call time so runtime env values are current
 // ON_SCREEN ack mode for "open X on my screen" commands
@@ -633,7 +626,7 @@ export async function generateResponseStreaming(userMessage, history = [], signa
         body: JSON.stringify({
           messages,
           max_tokens: 8192,
-          user: getActiveSessionUser(),
+          user: options.sessionUser || getActiveSessionUser(),
           stream: false,
           model: activeModel,
           ...THINKING_PARAM,
@@ -707,7 +700,7 @@ export async function generateResponseStreaming(userMessage, history = [], signa
       body: JSON.stringify({
         messages,
         max_tokens: 8192,
-        user: getActiveSessionUser(),
+        user: options.sessionUser || getActiveSessionUser(),
         stream: true,
         model: activeModel,
         ...THINKING_PARAM,
@@ -986,7 +979,7 @@ export async function generateResponse(userMessage, history = [], signal, option
       body: JSON.stringify({
         messages,
         max_tokens: 8192,
-        user: getActiveSessionUser(),
+        user: options.sessionUser || getActiveSessionUser(),
         model: voiceModel,
         ...THINKING_PARAM,
       }),
@@ -1244,15 +1237,12 @@ export async function generateTextResponse(userMessage, options = {}) {
     } catch (_) {}
   }
 
-  const _nowText = new Date();
-  const datetimeTag = `[DATETIME: ${_nowText.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}] `;
-
   const prior = Array.isArray(options.discordChatHistory) ? options.discordChatHistory : [];
   const messages = [{ role: 'system', content: textTag }];
   if (prior.length) {
     messages.push(...prior);
   }
-  messages.push({ role: 'user', content: `${datetimeTag}${channelCtx}${userMessage}` });
+  messages.push({ role: 'user', content: `${channelCtx}${userMessage}` });
 
   try {
     const res = await resilientFetch(COMPLETIONS_URL, {
@@ -1281,7 +1271,7 @@ export async function generateTextResponse(userMessage, options = {}) {
     const text = data.choices?.[0]?.message?.content || '';
 
     // Store to haivemind after reply — fire and forget, same category as read
-    storeChannelMemory(channelId, _stripPromptPreamble(userMessage), text).catch(() => {});
+    storeChannelMemory(channelId, userMessage, text).catch(() => {});
 
     return { text };
 
@@ -1289,6 +1279,26 @@ export async function generateTextResponse(userMessage, options = {}) {
     logger.error('Text gateway failed:', err.message);
     return { text: "Having trouble connecting to the gateway right now." };
   }
+}
+
+/**
+ * Render the last N user/assistant turns into a compact transcript block.
+ * The task-agent path spawns a fresh Claude session per turn (no --resume), so
+ * without this prelude every voice utterance behaves like a brand-new conversation
+ * and forgets the prior exchange. Trimmed for size; full state lives in haivemind.
+ */
+function _formatTaskAgentHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) return '';
+  // Drop the trailing user turn — that's the current message, included separately
+  const turns = history.slice(0, -1).filter(m => m && m.role && m.content);
+  if (turns.length === 0) return '';
+  const recent = turns.slice(-6); // last 3 exchanges, enough for follow-up context
+  const lines = recent.map(m => {
+    const role = m.role === 'assistant' ? 'JARVIS' : 'USER';
+    const text = String(m.content).substring(0, 600).replace(/\s+/g, ' ').trim();
+    return `${role}: ${text}`;
+  });
+  return `[RECENT VOICE CONVERSATION — for continuity; treat the user's current message as the active turn]\n${lines.join('\n')}\n\n`;
 }
 
 function buildTaskAgentPrompt(userMessage, options = {}) {
@@ -1301,12 +1311,18 @@ function buildTaskAgentPrompt(userMessage, options = {}) {
   const focusCtx = getFullFocusContext() || getFocusContextTag();
   if (focusCtx) contextTags += focusCtx + ' ';
 
+  // Conversation continuity: task-agent gateway path uses channelKey "task-agent:<id>"
+  // which always spawns a fresh claude -p session (chatId=null, no --resume). Without
+  // injecting recent turns here, every voice ACTION/EMAIL/CALENDAR/etc utterance loses
+  // memory of the prior exchange — Lance's "mid-lost everything" voice symptom.
+  const historyBlock = _formatTaskAgentHistory(options.history);
+
   const taskId = String(options.taskId || '').replace(/'/g, '');
   // Single-quote-safe snippet for shell embedding — apostrophes in speech break mcporter arg parsing
   const safeSnip = userMessage.substring(0, 120).replace(/"/g, '\\"').replace(/'/g, "\\'");
   return `${getVoiceTag()}
 
-${contextTags}${userMessage}
+${historyBlock}${contextTags}${userMessage}
 
 TASK AGENT INSTRUCTIONS:
 - You are a disposable task agent with full tool access. Complete this task fully.
@@ -1432,15 +1448,12 @@ export async function generateTextResponseStreaming(userMessage, onChunk, option
     } catch (_) {}
   }
 
-  const _nowTextStream = new Date();
-  const datetimeTagStream = `[DATETIME: ${_nowTextStream.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}] `;
-
   const priorStream = Array.isArray(options.discordChatHistory) ? options.discordChatHistory : [];
   const messages = [{ role: "system", content: textTag }];
   if (priorStream.length) {
     messages.push(...priorStream);
   }
-  messages.push({ role: "user", content: `${datetimeTagStream}${channelCtx}${userMessage}` });
+  messages.push({ role: "user", content: `${channelCtx}${userMessage}` });
 
   let fullText = "";
   let reader = null;
@@ -1500,7 +1513,7 @@ export async function generateTextResponseStreaming(userMessage, onChunk, option
     }
 
     // Store to haivemind after reply — fire and forget
-    storeChannelMemory(channelId, _stripPromptPreamble(userMessage), fullText).catch(() => {});
+    storeChannelMemory(channelId, userMessage, fullText).catch(() => {});
     return { text: fullText };
 
   } catch (err) {

@@ -66,7 +66,7 @@ export function initScheduler(dispatchFn) {
   logger.info(`[scheduler] started — ${schedules.length} schedule(s) loaded, tick every ${tickMs}ms`);
 }
 
-export function createSchedule({ prompt, intervalMs, channelId, userId, terminationPhrase, maxRuns, mode, model, shellCmd }) {
+export function createSchedule({ prompt, intervalMs, channelId, threadId, userId, terminationPhrase, maxRuns, mode, model, shellCmd }) {
   const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const entry = {
     id,
@@ -77,6 +77,7 @@ export function createSchedule({ prompt, intervalMs, channelId, userId, terminat
     intervalMs,
     nextRunAt: Date.now() + intervalMs,
     channelId,
+    threadId: threadId || null,    // post back to thread if created from one
     userId,
     createdAt: Date.now(),
     lastRunAt: null,

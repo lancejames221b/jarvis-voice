@@ -7,7 +7,7 @@
 import { SlashCommandBuilder, REST, Routes } from 'discord.js';
 import { isVisualModeEnabled, setVisualMode, getVisualTargetChannel, setVisualTargetChannel } from './visual-mode.js';
 import { isVerboseModeEnabled, setVerboseMode, enableVerboseForThread, disableVerboseForThread, clearThreadVerboseOverride } from './verbose-mode.js';
-import { getVoiceModel, setVoiceModel } from './brain/brain.js';
+import { getVoiceModel, setVoiceModel } from './brain.js';
 import { getChannelModel, setChannelModel, clearChannelModel } from './channel-models.js';
 import { readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
@@ -36,17 +36,15 @@ function _persistModel(alias) {
   } catch { /* non-fatal */ }
 }
 import { setFocusByName } from './focus-state.js';
-import { handleSpawnCommand, handleStopCommand } from './agent/spawn.js';
+import { handleSpawnCommand, handleStopCommand } from './slash/spawn.js';
 import { parseCredCommand, handleCredCommand } from './slash/cred.js';
 import { handleDirCommand, handleShellCommand } from './slash/shell.js';
 import { handleSkillCommand, listSkills } from './slash/skill.js';
 import { getBox, setBox, listBoxes, getCwd, persistBoxState, BOX_NAMES } from './slash/box-state.js';
 import { isOwner as isChannelOwner, grantAccess, revokeAccess, listAccess } from './channel-access.js';
 import { handleSessionCommand, startSessionDirect, buildResumeCommand } from './slash/session.js';
+import { LOOP_CMD, handleLoopCommand, stopLoop, isLoopRunning } from './slash/loop.js';
 import { findProjectMapByName } from './slash/project-map.js';
-import { handleNewKanbanChannelCommand } from './slash/new-kanban-channel.js';
-import { handleRegisterChannelCommand } from './slash/register-channel.js';
-import { handleLoopCommand, stopLoop, isLoopRunning } from './slash/loop.js';
 import logger from './logger.js';
 
 const SPAWN_CMD = new SlashCommandBuilder()
@@ -173,26 +171,6 @@ const INIT_CMD = new SlashCommandBuilder()
     sub.setName('all').setDescription('Initialize metadata for EVERY channel (uses LLM to infer summaries if empty)')
       .addBooleanOption(opt => opt.setName('force').setDescription('Rewrite even channels that already have metadata').setRequired(false))
       .addBooleanOption(opt => opt.setName('summarize').setDescription('Use LLM to summarize recent messages for channels without summary').setRequired(false)));
-
-const NEW_KANBAN_CHANNEL_CMD = new SlashCommandBuilder()
-  .setName('new-kanban-channel')
-  .setDescription('Create a new Discord channel with Kanban task management enabled')
-  .addStringOption(opt =>
-    opt.setName('name').setDescription('Channel name (no spaces, use hyphens)').setRequired(true))
-  .addStringOption(opt =>
-    opt.setName('project-path').setDescription('Absolute path to the project directory').setRequired(true))
-  .addChannelOption(opt =>
-    opt.setName('category').setDescription('Discord category to put the channel in').setRequired(false));
-
-const REGISTER_CHANNEL_CMD = new SlashCommandBuilder()
-  .setName('register-channel')
-  .setDescription('Create a Discord channel under a category and add it to channel-registry.json')
-  .addStringOption(opt =>
-    opt.setName('name').setDescription('Channel name (slugified automatically)').setRequired(true))
-  .addChannelOption(opt =>
-    opt.setName('category').setDescription('Discord category to put the channel in (picker)').setRequired(false))
-  .addStringOption(opt =>
-    opt.setName('category-name').setDescription('Category name (string, e.g. "engineering")').setRequired(false));
 
 const ACCESS_CMD = new SlashCommandBuilder()
   .setName('access')
@@ -328,23 +306,6 @@ const SONOS_CMD = new SlashCommandBuilder()
   .addSubcommand(sub => sub.setName('off').setDescription('Disable Sonos mode'))
   .addSubcommand(sub => sub.setName('status').setDescription('Show current Sonos routing'));
 
-const LOOP_CMD = new SlashCommandBuilder()
-  .setName('loop')
-  .setDescription('Run a prompt repeatedly in a thread, using a warm session (context carries across iterations)')
-  .addStringOption(opt =>
-    opt.setName('prompt').setDescription('What to run each iteration').setRequired(true))
-  .addStringOption(opt =>
-    opt.setName('interval').setDescription('How often to run (e.g. 30s, 2m, 1h) — omit for self-pacing'))
-  .addStringOption(opt =>
-    opt.setName('model').setDescription('Model to use: haiku, sonnet (default), opus')
-      .addChoices(
-        { name: 'haiku', value: 'haiku' },
-        { name: 'sonnet', value: 'sonnet' },
-        { name: 'opus', value: 'opus' },
-      ))
-  .addIntegerOption(opt =>
-    opt.setName('max').setDescription('Max iterations before auto-stopping (0 = unlimited)'));
-
 const VISUAL_CMD = new SlashCommandBuilder()
   .setName('visual')
   .setDescription('Toggle visual mode — responses go to text instead of voice')
@@ -373,9 +334,9 @@ export async function registerSlashCommands(client) {
     }
     await rest.put(
       Routes.applicationGuildCommands(client.user.id, guildId),
-      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), NEW_KANBAN_CHANNEL_CMD.toJSON(), REGISTER_CHANNEL_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON(), LOOP_CMD.toJSON()] }
+      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON(), LOOP_CMD.toJSON()] }
     );
-    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /new-kanban-channel, /register-channel, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos, /loop commands');
+    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos, /loop commands');
   } catch (err) {
     logger.error(`[slash] Failed to register commands: ${err.message}`);
   }
@@ -429,9 +390,24 @@ export async function handleSlashCommand(interaction, allowedUsers) {
     return true;
   }
 
+  if (interaction.commandName === 'loop') {
+    if (!isChannelOwner(interaction.user.id)) {
+      await interaction.reply({ content: 'Not authorized.', ephemeral: true });
+      return true;
+    }
+    await handleLoopCommand(interaction);
+    return true;
+  }
+
   if (interaction.commandName === 'stop') {
     if (!isChannelOwner(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true });
+      return true;
+    }
+    // If a loop is running in this thread, stop it first.
+    if (isLoopRunning(interaction.channelId)) {
+      stopLoop(interaction.channelId);
+      await interaction.reply('🛑 Loop stopped.');
       return true;
     }
     await handleStopCommand(interaction);
@@ -667,38 +643,6 @@ export async function handleSlashCommand(interaction, allowedUsers) {
     return true;
   }
 
-  if (interaction.commandName === 'new-kanban-channel') {
-    if (!isChannelOwner(interaction.user.id)) {
-      await interaction.reply({ content: 'Not authorized.', ephemeral: true });
-      return true;
-    }
-    try {
-      await handleNewKanbanChannelCommand(interaction);
-    } catch (err) {
-      logger.error(`[slash:new-kanban-channel] ${err.message}`);
-      const msg = `❌ /new-kanban-channel failed: ${err.message}`;
-      if (interaction.deferred || interaction.replied) await interaction.editReply(msg).catch(() => {});
-      else await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
-    }
-    return true;
-  }
-
-  if (interaction.commandName === 'register-channel') {
-    if (!isChannelOwner(interaction.user.id)) {
-      await interaction.reply({ content: 'Not authorized.', ephemeral: true });
-      return true;
-    }
-    try {
-      await handleRegisterChannelCommand(interaction);
-    } catch (err) {
-      logger.error(`[slash:register-channel] ${err.message}`);
-      const msg = `❌ /register-channel failed: ${err.message}`;
-      if (interaction.deferred || interaction.replied) await interaction.editReply(msg).catch(() => {});
-      else await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
-    }
-    return true;
-  }
-
   if (interaction.commandName === 'init') {
     if (!isChannelOwner(interaction.user.id)) {
       await interaction.reply({ content: 'Not authorized.', ephemeral: true });
@@ -774,7 +718,7 @@ export async function handleSlashCommand(interaction, allowedUsers) {
         const name = interaction.options.getString('name');
         const category = interaction.options.getChannel('category');
         const summary = interaction.options.getString('summary') || '';
-        const dir = interaction.options.getString('dir') || `~/Dev/${name.replace(/[^a-z0-9-]/gi, '-').toLowerCase()}`;
+        const dir = interaction.options.getString('dir') || `/home/yari/Dev/${name.replace(/[^a-z0-9-]/gi, '-').toLowerCase()}`;
         const model = interaction.options.getString('model') || 'claude-sonnet-4-6';
 
         const { ChannelType } = await import('discord.js');
@@ -836,8 +780,7 @@ export async function handleSlashCommand(interaction, allowedUsers) {
           try {
             const name = c.name;
             const entry = loadRegistry()[c.id] || {};
-            const devRoot = process.env.DEV_ROOT || `${process.env.HOME}/Dev`;
-            const dir = entry.directory || `${devRoot}/${(name || '').replace(/[^a-z0-9-]/gi, '-').toLowerCase()}`;
+            const dir = entry.directory || `/home/yari/Dev/${(name || '').replace(/[^a-z0-9-]/gi, '-').toLowerCase()}`;
             const model = entry.model || 'claude-sonnet-4-6';
             let summary = entry.summary || '';
 
@@ -1093,15 +1036,6 @@ export async function handleSlashCommand(interaction, allowedUsers) {
       const active = m === 'opus-plan';
       await interaction.reply({ content: `Plan mode: **${active ? 'ON' : 'OFF'}** (current model: \`${m}\`)` });
     }
-    return true;
-  }
-
-  if (interaction.commandName === 'loop') {
-    if (!isChannelOwner(interaction.user.id)) {
-      await interaction.reply({ content: '🚫 Not authorized.', ephemeral: true });
-      return true;
-    }
-    await handleLoopCommand(interaction);
     return true;
   }
 

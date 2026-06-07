@@ -28,6 +28,7 @@ import { parseOrchestrationCommand, orchestrateThread } from './thread-orchestra
 import { setAskMode } from './channel-ask-mode.js';
 import { parseSonosModeCommand, setSonosMode, clearSonosMode, resetSonosCtx, sonosScopeKey, VOICE_SCOPE, isSonosModeEnabled, setSonosCtx } from '../sonos-mode.js';
 import { createSchedule, listSchedules, deleteSchedule } from '../task-scheduler.js';
+import { stopLoop, isLoopRunning } from './slash/loop.js';
 import { isSessionChannel, handleSessionMessage } from './slash/session.js';
 import { isOwner as isChannelOwner } from './channel-access.js';
 import { verboseSessions } from './verbose-sessions.js';
@@ -73,7 +74,20 @@ export async function buildDiscordContextFromApi(message, limit = 10) {
         const isMe = m.author.bot && m.author.username === myUsername;
         const who = isMe ? 'You (assistant)' : m.author.username;
         const body = (m.content || '').substring(0, 400).replace(/\n/g, ' ');
-        return `${who}: ${body}`;
+        const attachParts = [];
+        if (m.attachments?.size) {
+          for (const a of m.attachments.values()) {
+            const ct = a.contentType?.split(';')[0]?.trim() || '';
+            const ext = a.name?.split('.').pop()?.toLowerCase() || '';
+            const isImage = ct.startsWith('image/') || ['png','jpg','jpeg','gif','webp'].includes(ext);
+            if (ct === 'audio/ogg' || a.url?.endsWith('.ogg')) continue;
+            attachParts.push(isImage
+              ? `[Image attachment: ${a.url}]`
+              : `[file: ${a.name} — ${a.url}]`);
+          }
+        }
+        const suffix = attachParts.length ? (body ? ' ' : '') + attachParts.join(' ') : '';
+        return `${who}: ${body}${suffix}`;
       })
       .join('\n');
 
@@ -501,6 +515,15 @@ export async function handleMentionReply(message, rawContent, isReplyToUs, audio
 
   if (!content) return;
 
+  // Natural language loop stop — if user says "stop", "stop loop", "done" in a loop thread
+  if (/^\s*(stop(\s+loop)?|done|cancel(\s+loop)?|quit)\s*\.?$/i.test(content)) {
+    const _loopThreadId = message.channel?.isThread?.() ? message.channelId : null;
+    if (_loopThreadId && stopLoop(_loopThreadId)) {
+      await message.reply('🛑 Loop stopped.');
+      return;
+    }
+  }
+
   let discordChatHistory = [];
   if (isDiscordMemoryReady() && shouldServeDiscordMemoryForMessage(message)) {
     const { history } = await ensureDiscordHistoryLoaded(message, client.user.id);
@@ -756,8 +779,7 @@ export async function handleMentionReply(message, rawContent, isReplyToUs, audio
   }
 
   const _isRecurringCheck =
-    /every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/i.test(content) &&
-    /(check|monitor|watch|run|poll|ping|test)\b/i.test(content);
+    /every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/i.test(content);
   const _isListSchedules = /\b(list|show|what)\b.{0,30}\bschedules?\b/i.test(content) ||
     /\bschedules?\s+(are\s+)?(running|active|pending)\b/i.test(content);
   const _isDeleteSchedule = /\b(stop|cancel|remove|delete)\b.{0,30}\bschedule\b/i.test(content);
@@ -786,28 +808,41 @@ export async function handleMentionReply(message, rawContent, isReplyToUs, audio
       maxRuns = Math.max(1, Math.floor(durationMs / intervalMs));
       if (terminationPhrase && /^\d+\s*(hour|minute|min|second|sec|h|m|s)/i.test(terminationPhrase)) terminationPhrase = null;
     }
+    // Parse optional model override: "using sonnet" / "using haiku" / "sonnet:" prefix
+    const _modelAliases = { haiku: 'haiku', sonnet: 'sonnet', opus: 'opus', 'claude-haiku': 'haiku', 'claude-sonnet': 'sonnet', 'claude-opus': 'opus' };
+    const _modelMatch = content.match(/\busing\s+(haiku|sonnet|opus|claude-haiku|claude-sonnet|claude-opus)\b/i)
+      || content.match(/\b(haiku|sonnet|opus):/i);
+    const _schedModel = _modelMatch ? (_modelAliases[_modelMatch[1].toLowerCase()] || 'haiku') : 'haiku';
+
     const corePrompt = content
       .replace(/every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
       .replace(/for\s+(?:the\s+next\s+)?\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
       .replace(/until\s+.+?(?:\.|$)/gi, '')
-      .replace(/^(check|monitor|watch|run|ping|poll)\s+/i, '')
+      .replace(/\busing\s+(haiku|sonnet|opus|claude-haiku|claude-sonnet|claude-opus)\b/gi, '')
+      .replace(/\b(haiku|sonnet|opus):/gi, '')
+      .replace(/^(check|monitor|watch|run|ping|poll|remind me to|remind me)\s+/i, '')
       .trim();
+    const _schedIsThread = message.channel?.isThread?.();
+    const _schedParentId = _schedIsThread ? (message.channel.parentId || message.channelId) : message.channelId;
+    const _schedThreadId = _schedIsThread ? message.channelId : null;
     const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(corePrompt || content);
     const sched = createSchedule({
       prompt: corePrompt || content,
       intervalMs,
-      channelId: message.channelId,
+      channelId: _schedParentId,
+      threadId: _schedThreadId,
       userId: message.author.id,
       terminationPhrase,
       maxRuns,
       mode: _schedMode,
-      model: 'haiku',
+      model: _schedModel,
       shellCmd: _shellCmd,
     });
     const humanInterval = intervalMs < 60000 ? `${intervalMs/1000}s` : `${intervalMs/60000}m`;
     const suffix = terminationPhrase ? ` until "${terminationPhrase}"` : maxRuns > 0 ? ` (${maxRuns} runs)` : '';
-    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ' 🤖 haiku';
-    await message.reply(`✅ Scheduled — will run every ${humanInterval}${suffix}${modeTag}. ID: \`${sched.id}\``);
+    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ` 🤖 ${_schedModel}`;
+    const threadTag = _schedThreadId ? ' (replies here)' : '';
+    await message.reply(`✅ Scheduled — every ${humanInterval}${suffix}${modeTag}${threadTag}. ID: \`${sched.id}\``);
     return;
   }
 
