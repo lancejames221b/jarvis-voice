@@ -1,6 +1,6 @@
 {
-  "name": "jarvis-voice",
-  "version": "1.0.0",
+  "name": "openjarvis",
+  "version": "2.0.0",
   "description": "Jarvis Discord Voice Bot - Real-time voice assistant",
   "type": "module",
   "main": "src/index.js",
