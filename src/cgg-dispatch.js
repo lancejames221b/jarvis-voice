@@ -301,15 +301,11 @@ export async function tryCggDispatch(message, content, opts = {}) {
 
 async function safeReply(message, payload) {
   try {
-    if (typeof payload === 'string') {
-      await message.reply(payload);
-    } else {
-      await message.reply(payload);
-    }
+    await message.reply(payload);
   } catch (err) {
     logger.warn(`[cgg] reply failed: ${(err.message || '').slice(0, 200)}`);
     try {
-      await message.channel?.send(typeof payload === 'string' ? payload : payload);
+      await message.channel?.send(payload);
     } catch {}
   }
 }

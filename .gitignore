@@ -14,6 +14,8 @@ config-backups/
 
 # Local env backups
 .env.backups/
+.env.bak*
+.cgg-deploy-backup-*/
 
 # Runtime / build artifacts
 *.deb
