@@ -69,6 +69,7 @@ import {
   getActivePersona,
   listPersonalities,
   generateResponse,
+  buildTaskAgentPrompt,
 } from '../brain/brain.js';
 
 import { readFileSync, readdirSync } from 'fs';
@@ -552,5 +553,51 @@ describe('Gateway circuit breaker', () => {
     // We just verify the API returns a boolean — the circuit may be open or closed
     // depending on prior test execution order.
     expect(typeof isGatewayCircuitOpen()).toBe('boolean');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task-agent conversation memory (ported from live 78ce6b7)
+// The task-agent gateway path spawns a fresh claude -p session per turn
+// (channelKey "task-agent:<id>", chatId=null, no --resume). buildTaskAgentPrompt
+// must inject recent turns so the agent remembers the prior exchange.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('buildTaskAgentPrompt() conversation memory', () => {
+  const history = [
+    { role: 'user', content: 'remind me what the capital of France is' },
+    { role: 'assistant', content: 'The capital of France is Paris.' },
+    { role: 'user', content: 'how many people live there' },
+  ];
+
+  it('renders prior turns into a RECENT VOICE CONVERSATION block', () => {
+    const prompt = buildTaskAgentPrompt('how many people live there', { history });
+    expect(prompt).toContain('[RECENT VOICE CONVERSATION');
+    // prior exchange must carry: turn N sees turn N-1 context
+    expect(prompt).toContain('USER: remind me what the capital of France is');
+    expect(prompt).toContain('JARVIS: The capital of France is Paris.');
+  });
+
+  it('drops the trailing user turn from the history block (it is the active message)', () => {
+    const prompt = buildTaskAgentPrompt('how many people live there', { history });
+    // Isolate just the RECENT VOICE CONVERSATION block (ends at the blank line before context tags).
+    const start = prompt.indexOf('[RECENT VOICE CONVERSATION');
+    const block = prompt.slice(start, prompt.indexOf('\n\n', start));
+    // The active turn must NOT be echoed inside the history block (it's appended separately).
+    expect(block).not.toContain('how many people live there');
+    // But the prior turns must be present in the block.
+    expect(block).toContain('remind me what the capital of France is');
+  });
+
+  it('omits the history block entirely when there is no prior context', () => {
+    const prompt = buildTaskAgentPrompt('first ever utterance', {
+      history: [{ role: 'user', content: 'first ever utterance' }],
+    });
+    expect(prompt).not.toContain('[RECENT VOICE CONVERSATION');
+  });
+
+  it('handles missing/empty history without throwing', () => {
+    expect(() => buildTaskAgentPrompt('hello', {})).not.toThrow();
+    expect(buildTaskAgentPrompt('hello', {})).not.toContain('[RECENT VOICE CONVERSATION');
+    expect(buildTaskAgentPrompt('hello', { history: [] })).not.toContain('[RECENT VOICE CONVERSATION');
   });
 });
