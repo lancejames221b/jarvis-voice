@@ -19,8 +19,8 @@ config-backups/
 
 # Runtime / build artifacts
 *.deb
-.claude/scheduled_tasks.json
-.claude/scheduled_tasks.lock
+.claude/
+.gstack/
 JarvisBlade/
 .qwen/
 .pi/
