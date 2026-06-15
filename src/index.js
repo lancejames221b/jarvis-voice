@@ -7,6 +7,7 @@
 
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
+import { tryCggDispatch } from './cgg-dispatch.js';
 import {
   joinVoiceChannel,
   VoiceConnectionStatus,
@@ -1194,6 +1195,19 @@ client.on('messageCreate', async (message) => {
   if (!canAccessChannel(message.author.id, _accessChannelId)) return;
 
   const content = (message.content || '').trim();
+
+  // H3-cgg: `!cgg <path> [filter] [hops]` or NL "call graph of <path>".
+  // Renders a cgg call graph to a PNG (inline) + attaches the raw .mmd.
+  // Intercepts before the brain; falls through when no cgg intent matches.
+  {
+    let cggBase;
+    try {
+      const { getKanbanPath } = await import('./state/focus-state.js');
+      cggBase = getKanbanPath?.(message.channelId) || undefined;
+    } catch {}
+    const cggRes = await tryCggDispatch(message, content, cggBase ? { base: cggBase } : {});
+    if (cggRes?.handled) return;
+  }
 
   // H4a: explicit /focus or /handoff — handle and return
   if (/^\/(handoff|focus)(\s|$)/i.test(content)) {
