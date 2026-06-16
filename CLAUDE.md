@@ -51,6 +51,29 @@ Slash command `/new-kanban-channel name:<…> project-path:<abs-path>` (`src/dis
 
 Skill: `skills/kanban/SKILL.md` — full operations reference. Setup: `skills/kanban/SETUP.md`.
 
+### telegram (`src/telegram/{transport,adapter,registry,engine,format,commands}.js`)
+
+A peer transport on the same brain as Discord/voice. A Telegram chat (or forum topic) behaves like a Discord channel: it binds to a project directory and routes messages to the shared agent.
+
+- `transport.js` — `node-telegram-bot-api` long-polling. `normalizeUpdate(message)` reduces a raw Telegram update to a neutral `{userId,chatId,topicId,text,messageId}` shape (null for non-text); `splitSend()` shapes send options (`message_thread_id` for forum topics); `createTransport(token, onMessage)` wires the live bot.
+- `adapter.js` — the bridge. `handleUpdate()` enforces the access gate, routes slash commands, and sends plain messages to the brain (`generateResponseStreaming`) with a per-chat live-history window; replies are shaped by `terseStatus` (one status line) + `detailBody` (4096-char follow-up chunks). `startTelegram()` is the bootstrap entry, lazy-imported from `src/index.js`'s `ready` handler; it no-ops without `TELEGRAM_BOT_TOKEN`.
+- `registry.js` — `telegramChatKey(chatId, topicId)`, `getTelegramProjectPath(chatKey)`, `registerTelegramChat(chatKey, projectPath)`. Bindings live under a `telegram` key in the same channel-registry file Discord uses.
+- `engine.js` — per-chat engine store (`claude` | `qwen`) at `~/.local/state/jarvis-voice/telegram-engine.json`. `resolveEngineEnv(engine)` returns the `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `model` overrides for the qwen path (LM Studio host from `JARVIS_LMS_BASE_URL`). The gateway applies that overlay to the SAME `claude -p` spawn (see jarvis-gateway `spawnClaudeStream` `engineEnv` argument), so switching engines is an env swap, not a separate client.
+- `format.js` / `commands.js` — pure helpers (watch-formatting and the `/register /engine /model /status /cancel` parser, `@BotName`-suffix aware).
+
+**Session-key shape:** `agent:main:telegram:chat:<chatId>[:topic:<topicId>]`. The gateway's `resolveProfile()` strips the `:topic:<id>` suffix (same path as Discord's `:thread:`), so a forum topic inherits its parent chat's Claude profile.
+
+**Access model:** tier-1 owner (`isOwner`, `TELEGRAM_OWNER_ID`) may run all commands and coding; tier-2 allowlist (`TELEGRAM_ALLOWED_USERS`, comma-separated) gets chat/status only; everyone else is refused. Owner-only commands: `/register`, `/engine`, `/model`, `/cancel`.
+
+**config.yaml block** (mapped to env by `src/config-env-bootstrap.js`):
+
+```yaml
+telegram:
+  token: "<bot token from @BotFather>"
+  owner: "<your telegram numeric user id>"
+  allowedUsers: "<comma-separated tier-2 ids>"   # chat/status only
+```
+
 ### haivemind (`haivemind/` submodule)
 
 Python-based collective memory system. Provides ChromaDB vector storage + Redis caching + MCP server interface. Used by jarvis-gateway to store/retrieve per-channel conversation summaries and cross-agent knowledge. Has its own `haivemind/Claude.md`.
