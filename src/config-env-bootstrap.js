@@ -35,6 +35,11 @@ const YAML_TO_ENV = [
   ['discord.botId',             'JARVIS_BOT_ID'],
   ['discord.ownerUserId',       'OWNER_USER_ID'],
 
+  // telegram.*
+  ['telegram.token',        'TELEGRAM_BOT_TOKEN'],
+  ['telegram.owner',        'TELEGRAM_OWNER_ID'],
+  ['telegram.allowedUsers', 'TELEGRAM_ALLOWED_USERS'],
+
   // gateway.*
   ['gateway.url',               'JARVIS_GATEWAY_URL'],
   ['gateway.token',             'JARVIS_GATEWAY_TOKEN'],
