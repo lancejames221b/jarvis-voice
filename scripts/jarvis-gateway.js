@@ -373,6 +373,23 @@ function spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv 
   return child;
 }
 
+// Map any channelKey to the stable haivemind memory category for that surface.
+// Thread/topic suffixes are stripped so a thread/topic shares its parent's
+// memory (same inheritance the profile/ask-mode/mcp lookups already use).
+//   discord:  agent:main:discord:channel:<id>[:thread:<tid>]  -> channel:<id>
+//   telegram: agent:main:telegram:chat:<id>[:topic:<tid>]     -> channel:telegram:chat:<id>
+// Returns null for an unrecognized key (memory then skipped, not misfiled).
+// IMPORTANT: this must agree with the read side (getChannelContext, which
+// prepends "channel:" to the channelId it is handed) — see brain.js.
+function memoryCategory(channelKey) {
+  const k = String(channelKey || "");
+  const d = k.match(/discord:channel:(\d+)/);
+  if (d) return `channel:${d[1]}`;
+  const t = k.match(/telegram:chat:([\w-]+)/);
+  if (t) return `channel:telegram:chat:${t[1]}`;
+  return null;
+}
+
 // Summarize the old chatId to haivemind before rotation so context survives.
 // Fire-and-forget — does not block the rotation; new chat starts fresh immediately.
 async function summarizeAndStoreChat(channelKey, oldChatId) {
@@ -380,19 +397,20 @@ async function summarizeAndStoreChat(channelKey, oldChatId) {
   try {
     const result = await callClaudeAgent(SUMMARY_PROMPT, DEFAULT_CLAUDE_MODEL, oldChatId);
     if (!result.text) return;
-    // Store to haivemind under channel namespace — getChannelContext() will pick this up next turn
-    const channelId = (channelKey.match(/channel:(\d+)/) || [])[1];
-    if (channelId && DISCORD_TOKEN) {
-      // Use the MCP JSON-RPC envelope via storeMemory(). The prior code POSTed to
-      // a bare /store_memory path that haivemind doesn't serve — every session
-      // summary was silently dropped, and chat_summary_stored logs were misleading.
+    // Store under the per-surface namespace — getChannelContext() reads it next turn.
+    // (Previously this only matched discord:channel:<id> AND required DISCORD_TOKEN,
+    // so Telegram session summaries were silently dropped — Telegram had no memory.)
+    const category = memoryCategory(channelKey);
+    if (category) {
+      // Use the MCP JSON-RPC envelope via storeMemory(). A prior bug POSTed to a
+      // bare /store_memory path haivemind doesn't serve, silently dropping summaries.
       try {
-        await storeMemory(`[SESSION SUMMARY] ${result.text}`, `channel:${channelId}`);
+        await storeMemory(`[SESSION SUMMARY] ${result.text}`, category);
       } catch (err) {
-        log("chat_summary_store_failed", { channelKey, channelId, error: err.message });
+        log("chat_summary_store_failed", { channelKey, category, error: err.message });
       }
     }
-    log("chat_summary_stored", { channelKey, channelId, chars: result.text.length });
+    log("chat_summary_stored", { channelKey, category, chars: result.text.length });
   } catch (e) {
     log("chat_summary_failed", { channelKey, error: e.message });
   }

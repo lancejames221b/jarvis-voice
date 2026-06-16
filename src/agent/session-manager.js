@@ -395,7 +395,12 @@ async function _haivemindGetRecent(category, { hours = 2, limit = 5 } = {}) {
 export async function getChannelContext(channelId) {
   if (!HAIVEMIND_ENABLED || !channelId) return null;
   try {
-    const raw = await _haivemindGetRecent(`channel:${channelId}`, { hours: 2, limit: 5 });
+    // Strip a thread/topic suffix so a thread/topic reads its parent's memory —
+    // this MUST match the write-side namespace (jarvis-gateway memoryCategory).
+    // Discord passes a bare numeric id (no suffix); Telegram passes the full
+    // chat key "telegram:chat:<id>[:topic:<tid>]".
+    const category = `channel:${String(channelId).replace(/:(thread|topic):[\w-]+$/, '')}`;
+    const raw = await _haivemindGetRecent(category, { hours: 2, limit: 5 });
     if (!raw) return null;
     const data = JSON.parse(raw);
     const memories = data?.result?.memories || data?.memories || [];

@@ -34,7 +34,7 @@ const fetchMock = vi.fn().mockResolvedValue({
 vi.stubGlobal('fetch', fetchMock);
 
 // ── Import the module under test ──────────────────────────────────────────────
-const { getOrCreateChatId, incrementChatTurns, _resetChatState } =
+const { getOrCreateChatId, incrementChatTurns, _resetChatState, getChannelContext } =
   await import('../agent/session-manager.js');
 
 // UUID v4 regex
@@ -214,4 +214,34 @@ it('concurrent getOrCreateChatId calls for the same key resolve to one chatId', 
   const stored = JSON.parse(readFileSync(SESSION_STORE, 'utf8'));
   const keys = Object.keys(stored).filter(k => k === 'chan-concurrent');
   expect(keys).toHaveLength(1);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getChannelContext — per-surface memory namespace (must match the gateway's
+// write-side memoryCategory, with thread/topic suffix stripped).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('getChannelContext memory namespace', () => {
+  // Extract the category argument from the haivemind get_recent JSON-RPC body.
+  function categoryFromLastFetch() {
+    const call = fetchMock.mock.calls[fetchMock.mock.calls.length - 1];
+    const body = JSON.parse(call[1].body);
+    return body?.params?.arguments?.category
+      ?? body?.params?.arguments?.source
+      ?? JSON.stringify(body); // surface the shape if the field name differs
+  }
+
+  it('queries channel:<id> for a bare Discord channel id', async () => {
+    await getChannelContext('123456');
+    expect(categoryFromLastFetch()).toContain('channel:123456');
+  });
+
+  it('strips a Telegram :topic: suffix so a topic reads its parent chat memory', async () => {
+    await getChannelContext('telegram:chat:6328994380:topic:7');
+    expect(categoryFromLastFetch()).toContain('channel:telegram:chat:6328994380');
+  });
+
+  it('queries channel:telegram:chat:<id> for a topic-less Telegram chat', async () => {
+    await getChannelContext('telegram:chat:6328994380');
+    expect(categoryFromLastFetch()).toContain('channel:telegram:chat:6328994380');
+  });
 });
