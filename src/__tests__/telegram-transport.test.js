@@ -30,6 +30,42 @@ describe('normalizeUpdate', () => {
       kind: 'voice', fileId: 'AAA-file', duration: 3, caption: null,
     });
   });
+  it('normalizes a photo to a kind:image update using the largest size variant', () => {
+    const msg = {
+      message_id: 9, from: { id: 555 }, chat: { id: 111 },
+      photo: [
+        { file_id: 'small', width: 90 },
+        { file_id: 'large', width: 1280 },
+      ],
+      caption: 'look',
+    };
+    expect(normalizeUpdate(msg)).toEqual({
+      userId: '555', chatId: '111', topicId: null, messageId: '9',
+      kind: 'image', fileId: 'large', caption: 'look',
+    });
+  });
+  it('normalizes a document to a kind:document update with name + mime', () => {
+    const msg = {
+      message_id: 9, from: { id: 555 }, chat: { id: 111 },
+      document: { file_id: 'DOC1', file_name: 'report.pdf', mime_type: 'application/pdf' },
+      caption: 'read this',
+    };
+    expect(normalizeUpdate(msg)).toEqual({
+      userId: '555', chatId: '111', topicId: null, messageId: '9',
+      kind: 'document', fileId: 'DOC1', fileName: 'report.pdf',
+      mimeType: 'application/pdf', caption: 'read this',
+    });
+  });
+  it('routes a document with an image/* mime to the image path', () => {
+    const msg = {
+      message_id: 9, from: { id: 555 }, chat: { id: 111 },
+      document: { file_id: 'IMGDOC', file_name: 'shot.png', mime_type: 'image/png' },
+    };
+    const out = normalizeUpdate(msg);
+    expect(out.kind).toBe('image');
+    expect(out.fileId).toBe('IMGDOC');
+    expect(out.mimeType).toBe('image/png');
+  });
   it('returns null for an unhandled message type (e.g. a sticker)', () => {
     expect(normalizeUpdate({ message_id: 9, from: { id: 5 }, chat: { id: 1 } })).toBeNull();
   });

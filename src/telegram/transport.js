@@ -24,7 +24,32 @@ export function normalizeUpdate(message) {
       caption: typeof message.caption === 'string' ? message.caption : null,
     };
   }
-  // Anything else (sticker, photo, document, location, …) — not handled.
+  // Photo — Telegram delivers an array of size variants, smallest → largest.
+  // Take the last (largest) so vision has the most detail to work with.
+  if (Array.isArray(message.photo) && message.photo.length) {
+    const largest = message.photo[message.photo.length - 1];
+    if (largest?.file_id) {
+      return {
+        ...base,
+        kind: 'image',
+        fileId: String(largest.file_id),
+        caption: typeof message.caption === 'string' ? message.caption : null,
+      };
+    }
+  }
+  // Document — any file the user attaches. An image sent as a file (uncompressed)
+  // arrives here with an image/* mime, so route those to the image path too.
+  if (message.document && message.document.file_id) {
+    const doc = message.document;
+    const mimeType = typeof doc.mime_type === 'string' ? doc.mime_type : null;
+    const fileName = typeof doc.file_name === 'string' ? doc.file_name : null;
+    const caption = typeof message.caption === 'string' ? message.caption : null;
+    if (mimeType && mimeType.startsWith('image/')) {
+      return { ...base, kind: 'image', fileId: String(doc.file_id), caption, fileName, mimeType };
+    }
+    return { ...base, kind: 'document', fileId: String(doc.file_id), fileName, mimeType, caption };
+  }
+  // Anything else (sticker, location, …) — not handled.
   return null;
 }
 

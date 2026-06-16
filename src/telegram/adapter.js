@@ -8,6 +8,7 @@ import { parseCommand } from './commands.js';
 import { terseStatus, detailBody } from './format.js';
 import { createTransport } from './transport.js';
 import { transcribeVoiceNote } from './voice-in.js';
+import { buildAttachmentContext } from './attachments.js';
 
 // per-chat in-memory live window (durability is the memory layer's job, not this)
 const histories = new Map();      // chatKey -> [{role, content}]
@@ -64,9 +65,52 @@ export async function handleUpdate(update, deps) {
     await send(chatId, `🎤 “${text}”`, topicId ? { topicId } : {});
   }
 
-  // Only typed messages are parsed as slash commands. A voice transcript that
-  // happens to render with a leading "/" should be chatted, not executed.
-  const cmd = update.kind === 'voice' ? null : parseCommand(text);
+  // Image / document: download the file, build a prompt-context block (vision
+  // description for images, inlined/handed-off content for documents) and treat
+  // that as the message. The text-only brain can't see pixels, so the picture is
+  // turned into words here (src/telegram/vision.js + attachments.js).
+  if (update.kind === 'image' || update.kind === 'document') {
+    if (!deps.downloadFile) {
+      await send(chatId, '📎 attachments are not enabled here', topicId ? { topicId } : {});
+      return;
+    }
+    // Documents land in the bound project dir so the agent can open them by path;
+    // images go to a temp dir (consumed by the vision call, not opened later).
+    const projectPath = getTelegramProjectPath(chatKey);
+    const dir = update.kind === 'document'
+      ? (projectPath || deps.tmpDir || '/tmp')
+      : (deps.tmpDir || '/tmp');
+    let savedPath;
+    try {
+      savedPath = await deps.downloadFile(update.fileId, dir);
+    } catch (e) {
+      logger.error({ err: e.message, chatKey, kind: update.kind }, '[telegram] attachment download failed');
+      await send(chatId, "⚠️ couldn't download that attachment", topicId ? { topicId } : {});
+      return;
+    }
+    if (update.kind === 'image') {
+      await send(chatId, '🖼️ looking at that image…', topicId ? { topicId } : {});
+    }
+    const ctx = await buildAttachmentContext({
+      kind: update.kind,
+      path: savedPath,
+      fileName: update.fileName || savedPath.split('/').pop(),
+      mimeType: update.mimeType || null,
+      caption: update.caption || null,
+    });
+    // The brain message is the caption (the user's actual ask) plus the context.
+    // With no caption, a neutral lead-in keeps the prompt well-formed.
+    const lead = update.caption
+      ? String(update.caption).trim()
+      : (update.kind === 'image' ? 'Take a look at this image.' : 'Take a look at this file.');
+    text = `${lead}${ctx}`;
+  }
+
+  // Only typed messages are parsed as slash commands. A voice transcript or an
+  // attachment caption that happens to start with "/" should be chatted, not run.
+  const cmd = (update.kind === 'voice' || update.kind === 'image' || update.kind === 'document')
+    ? null
+    : parseCommand(text);
   if (cmd) {
     await handleCommand(cmd, { chatKey, chatId, owner, send });
     return;
@@ -155,6 +199,7 @@ export function startTelegram() {
     handleUpdate(update, {
       send: (cid, text, opts) => transport.sendMessage(cid, text, opts),
       allowedUsers,
+      tmpDir: process.env.TELEGRAM_TMP_DIR || '/tmp',
       downloadFile: (fileId, dir) => transport.downloadFile(fileId, dir),
       transcribeVoice: (oggPath) => transcribeVoiceNote(oggPath),
     }));

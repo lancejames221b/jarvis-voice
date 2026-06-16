@@ -19,10 +19,14 @@ vi.mock('../telegram/engine.js', () => ({
   setEngine: vi.fn(),
   resolveEngineEnv: vi.fn(() => ({})),
 }));
+vi.mock('../telegram/attachments.js', () => ({
+  buildAttachmentContext: vi.fn(),
+}));
 
 import { isTelegramOwner } from '../channel-access.js';
 import { generateTextResponse } from '../brain/brain.js';
 import { getTelegramProjectPath } from '../telegram/registry.js';
+import { buildAttachmentContext } from '../telegram/attachments.js';
 import { handleUpdate } from '../telegram/adapter.js';
 
 function makeSend() { return vi.fn().mockResolvedValue(undefined); }
@@ -117,5 +121,84 @@ describe('handleUpdate — access gate', () => {
     );
     expect(generateTextResponse).not.toHaveBeenCalled();
     expect(send.mock.calls[0][1]).toMatch(/not enabled/i);
+  });
+
+  it('image: downloads to tmp, builds vision context, routes caption+context to the brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'that is a cat' });
+    buildAttachmentContext.mockResolvedValue('\n\n[image desc: a cat]');
+    const send = makeSend();
+    const downloadFile = vi.fn().mockResolvedValue('/tmp/photo.jpg');
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'image', fileId: 'IMG1', caption: 'whats this', messageId: '9' },
+      { send, downloadFile, tmpDir: '/tmp' },
+    );
+    // images go to the temp dir, not the project dir
+    expect(downloadFile).toHaveBeenCalledWith('IMG1', '/tmp');
+    expect(buildAttachmentContext).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'image', path: '/tmp/photo.jpg', caption: 'whats this' }),
+    );
+    // brain gets the caption (the real ask) plus the vision context
+    const prompt = generateTextResponse.mock.calls[0][0];
+    expect(prompt).toContain('whats this');
+    expect(prompt).toContain('a cat');
+    expect(send).toHaveBeenCalledWith('111', 'that is a cat', expect.any(Object));
+  });
+
+  it('image with no caption: still routes a well-formed prompt to the brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'ok' });
+    buildAttachmentContext.mockResolvedValue('\n\n[image desc: a chart]');
+    const send = makeSend();
+    const downloadFile = vi.fn().mockResolvedValue('/tmp/p.png');
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'image', fileId: 'IMG2', caption: null, messageId: '9' },
+      { send, downloadFile, tmpDir: '/tmp' },
+    );
+    const prompt = generateTextResponse.mock.calls[0][0];
+    expect(prompt).toMatch(/take a look at this image/i);
+    expect(prompt).toContain('a chart');
+  });
+
+  it('document: downloads into the bound project dir and routes context to the brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    getTelegramProjectPath.mockReturnValue('/home/u/proj');
+    generateTextResponse.mockResolvedValue({ text: 'reviewed' });
+    buildAttachmentContext.mockResolvedValue('\n\n[File: notes.md]\n```\nhi\n```');
+    const send = makeSend();
+    const downloadFile = vi.fn().mockResolvedValue('/home/u/proj/notes.md');
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'document', fileId: 'DOC1', fileName: 'notes.md', mimeType: 'text/markdown', caption: 'summarize', messageId: '9' },
+      { send, downloadFile, tmpDir: '/tmp' },
+    );
+    // documents save into the project dir so the agent can open them by path
+    expect(downloadFile).toHaveBeenCalledWith('DOC1', '/home/u/proj');
+    const prompt = generateTextResponse.mock.calls[0][0];
+    expect(prompt).toContain('summarize');
+    expect(prompt).toContain('notes.md');
+    expect(send).toHaveBeenCalledWith('111', 'reviewed', expect.any(Object));
+  });
+
+  it('attachment when downloadFile dep is absent: replies "not enabled", no brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    const send = makeSend();
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'image', fileId: 'IMG1', messageId: '9' },
+      { send },
+    );
+    expect(generateTextResponse).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][1]).toMatch(/not enabled/i);
+  });
+
+  it('attachment download failure: replies an error, no brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    const send = makeSend();
+    const downloadFile = vi.fn().mockRejectedValue(new Error('boom'));
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'image', fileId: 'IMG1', messageId: '9' },
+      { send, downloadFile, tmpDir: '/tmp' },
+    );
+    expect(generateTextResponse).not.toHaveBeenCalled();
+    expect(send.mock.calls.some(([, t]) => /couldn.t download/i.test(t))).toBe(true);
   });
 });
