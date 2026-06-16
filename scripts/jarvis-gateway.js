@@ -295,7 +295,7 @@ function collapseMessages(messages = []) {
 
 // Spawn claude -p with stream-json output; optionally resume a prior session.
 // Prompt is written to stdin to avoid ARG_MAX limits on large conversation histories.
-function spawnClaudeStream(prompt, model, chatId, channelKey, effort) {
+function spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv = null) {
   const askMode = _channelIsInAskMode(channelKey);
   const base = askMode ? ASK_MODE_ARGS : BASE_ARGS;
 
@@ -342,6 +342,13 @@ function spawnClaudeStream(prompt, model, chatId, channelKey, effort) {
     if (process.env.JARVIS_CLAUDEFLARE_TOKEN) cleanEnv.ANTHROPIC_AUTH_TOKEN = process.env.JARVIS_CLAUDEFLARE_TOKEN;
   } else {
     delete cleanEnv.ANTHROPIC_BASE_URL;
+  }
+  // Per-request engine overlay (Telegram /engine qwen): point the SAME claude -p
+  // subprocess at LM Studio. Wins over ClaudeFlare for this spawn. null/{} for claude.
+  if (engineEnv && engineEnv.ANTHROPIC_BASE_URL) {
+    cleanEnv.ANTHROPIC_BASE_URL = engineEnv.ANTHROPIC_BASE_URL;
+    if (engineEnv.ANTHROPIC_AUTH_TOKEN) cleanEnv.ANTHROPIC_AUTH_TOKEN = engineEnv.ANTHROPIC_AUTH_TOKEN;
+    log("engine_overlay_spawn", { channelKey, baseUrl: engineEnv.ANTHROPIC_BASE_URL });
   }
   const profile = resolveProfile(channelKey);
   if (profile?.configDir) cleanEnv.CLAUDE_CONFIG_DIR = profile.configDir;
@@ -489,12 +496,12 @@ setInterval(() => {
 
 // Buffer the full response from claude -p (non-streaming path).
 // Parses NDJSON lines; extracts text from result event and session_id from system:init.
-async function callClaudeAgent(prompt, modelOverride, chatId, channelKey) {
+async function callClaudeAgent(prompt, modelOverride, chatId, channelKey, engineEnv = null) {
   const effort = effortForAlias(modelOverride);
   const model = resolveModel(modelOverride) || DEFAULT_CLAUDE_MODEL;
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort);
+    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv);
     let buf = "";
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d; });
@@ -577,13 +584,13 @@ function _toolResultPreview(toolName, raw) {
 
 // Stream claude -p NDJSON deltas directly to an SSE response.
 // Returns the resolvedSessionId once the stream completes.
-async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort) {
+async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, engineEnv = null) {
   const completionId = `chatcmpl-${crypto.randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort);
+    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv);
     let lineBuf = "";
     let resolvedSessionId = chatId;
     let clientAborted = false;
@@ -931,7 +938,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
       let resolvedSessionId;
       try {
-        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort);
+        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, req.body?.engineEnv || null);
       } catch (streamError) {
         releaseLock();
         // Don't try to write to a closed/aborted socket.
@@ -959,7 +966,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
     }
 
     // Non-streaming path
-    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey);
+    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || null);
     setSession(channelKey, result.sessionId);
     releaseLock();
     res.json(openAiCompletionResponse(requestedModel, result.text));
