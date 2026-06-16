@@ -1256,6 +1256,10 @@ client.once('ready', async () => {
   // Start admin HTTP API for the dashboard (no-op if JARVIS_ADMIN_TOKEN unset)
   import('./admin-api.js').then(m => m.startAdminApi({ discordClient: client })).catch(e => logger.warn(`[admin-api] start error: ${e.message}`));
 
+  // Start the Telegram adapter — a peer transport on the same brain.
+  // No-ops without TELEGRAM_BOT_TOKEN; lazy-imported so its bot dep stays optional.
+  import('./telegram/adapter.js').then(m => m.startTelegram()).catch(e => logger.warn(`[telegram] start error: ${e.message}`));
+
   // Patch any live-stream messages left in "thinking" state by a prior crash
   import('./live-stream.js').then(m => m.sweepOrphanedStreams()).catch(e => logger.warn(`[live-stream] sweep error: ${e.message}`));
 
