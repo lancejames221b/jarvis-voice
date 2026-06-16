@@ -31,6 +31,7 @@ export async function handleUpdate(update, deps) {
   const chatKey = telegramChatKey(chatId, topicId);
   const owner = isTelegramOwner(userId);
   const allowlisted = owner || allowedUsers.includes(String(userId));
+  logger.info({ userId, chatId, topicId, owner, allowlisted }, '[telegram] inbound');
 
   if (!allowlisted) {
     await send(chatId, 'not authorized', {});
