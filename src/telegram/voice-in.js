@@ -29,13 +29,19 @@ const execAsync = promisify(_exec);
 export async function transcribeVoiceNote(oggPath, deps = {}) {
   const exec = deps.exec || execAsync;
   const transcribe = deps.transcribe || transcribeWhisperOnly;
-  const wavPath = `${oggPath}.wav`;
+  // Unique WAV path per invocation. downloadFile names the OGG deterministically
+  // from Telegram's file_path, so two overlapping handlers for the SAME voice
+  // note would otherwise transcode to the same wav and double-delete it mid-read.
+  const uniq = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  const wavPath = `${oggPath}.${uniq}.wav`;
 
   try {
     // OGG/Opus -> 16 kHz mono PCM WAV (Whisper's expected input).
+    // killSignal SIGKILL so a hung ffmpeg dies immediately on timeout rather
+    // than flushing a partial wav after the finally-block unlink.
     await exec(
       `ffmpeg -y -i "${oggPath}" -ar 16000 -ac 1 -acodec pcm_s16le "${wavPath}"`,
-      { timeout: 60_000 },
+      { timeout: 60_000, killSignal: 'SIGKILL' },
     );
     const text = (await transcribe(wavPath)) || '';
     return text.trim();

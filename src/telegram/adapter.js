@@ -64,7 +64,9 @@ export async function handleUpdate(update, deps) {
     await send(chatId, `🎤 “${text}”`, topicId ? { topicId } : {});
   }
 
-  const cmd = parseCommand(text);
+  // Only typed messages are parsed as slash commands. A voice transcript that
+  // happens to render with a leading "/" should be chatted, not executed.
+  const cmd = update.kind === 'voice' ? null : parseCommand(text);
   if (cmd) {
     await handleCommand(cmd, { chatKey, chatId, owner, send });
     return;
