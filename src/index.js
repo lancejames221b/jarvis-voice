@@ -6,6 +6,11 @@
  */
 
 import 'dotenv/config';
+// Hydrate process.env from the unified config.yaml AFTER .env (baseline) and
+// BEFORE any module reads process.env at top level. The gateway does the same
+// at its entry; the voice process needs it too so config.yaml values (e.g.
+// telegram.token -> TELEGRAM_BOT_TOKEN) reach startTelegram().
+import './config-env-bootstrap.js';
 import { Client, GatewayIntentBits } from 'discord.js';
 import { tryCggDispatch } from './cgg-dispatch.js';
 import {
