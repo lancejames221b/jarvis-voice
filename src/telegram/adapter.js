@@ -1,5 +1,5 @@
 import logger from '../logger.js';
-import { isOwner } from '../channel-access.js';
+import { isTelegramOwner } from '../channel-access.js';
 import { generateResponseStreaming } from '../brain/brain.js';
 import { getChannelModel } from '../channel-models.js';
 import { telegramChatKey, getTelegramProjectPath, registerTelegramChat } from './registry.js';
@@ -29,7 +29,7 @@ export async function handleUpdate(update, deps) {
   const send = deps.send;
   const allowedUsers = deps.allowedUsers || [];
   const chatKey = telegramChatKey(chatId, topicId);
-  const owner = isOwner(userId);
+  const owner = isTelegramOwner(userId);
   const allowlisted = owner || allowedUsers.includes(String(userId));
 
   if (!allowlisted) {

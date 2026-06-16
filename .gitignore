@@ -12,6 +12,10 @@ __pycache__/
 *.pyc
 config-backups/
 
+# Secrets — config.yaml holds bot tokens / owner ids; never commit it
+config.yaml
+config.yml
+
 # Local env backups
 .env.backups/
 .env.bak*

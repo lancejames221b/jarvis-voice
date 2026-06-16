@@ -21,6 +21,9 @@ const ACCESS_FILE = join(__dirname, '..', 'data', 'channel-access.json');
 const OWNER_USER_ID = process.env.OWNER_USER_ID ||
   (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean)[0] || '';
 
+// Telegram owner is a SEPARATE numeric id (Telegram and Discord id spaces differ).
+const TELEGRAM_OWNER_ID = (process.env.TELEGRAM_OWNER_ID || '').trim();
+
 // In-memory grants: Map<channelId, Set<userId>>
 let _grants = new Map();
 
@@ -50,6 +53,11 @@ _load();
 /** True only for the bot owner. */
 export function isOwner(userId) {
   return !!OWNER_USER_ID && userId === OWNER_USER_ID;
+}
+
+/** True only for the Telegram bot owner (separate numeric id from the Discord owner). */
+export function isTelegramOwner(userId) {
+  return !!TELEGRAM_OWNER_ID && String(userId) === TELEGRAM_OWNER_ID;
 }
 
 /** True if userId is the owner OR has been granted access to channelId. */
@@ -85,4 +93,4 @@ export function listAccess() {
   return [..._grants.entries()].map(([channelId, users]) => ({ channelId, userIds: [...users] }));
 }
 
-export { OWNER_USER_ID };
+export { OWNER_USER_ID, TELEGRAM_OWNER_ID };

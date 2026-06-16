@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 vi.mock('../channel-access.js', () => ({
   isOwner: vi.fn(),
+  isTelegramOwner: vi.fn(),
   canAccessChannel: vi.fn(),
 }));
 vi.mock('../brain/brain.js', () => ({
@@ -19,7 +20,7 @@ vi.mock('../telegram/engine.js', () => ({
   resolveEngineEnv: vi.fn(() => ({})),
 }));
 
-import { isOwner } from '../channel-access.js';
+import { isTelegramOwner } from '../channel-access.js';
 import { generateResponseStreaming } from '../brain/brain.js';
 import { getTelegramProjectPath } from '../telegram/registry.js';
 import { handleUpdate } from '../telegram/adapter.js';
@@ -30,7 +31,7 @@ describe('handleUpdate — access gate', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('owner plain chat: calls the brain and replies', async () => {
-    isOwner.mockReturnValue(true);
+    isTelegramOwner.mockReturnValue(true);
     generateResponseStreaming.mockResolvedValue({ text: 'hi there' });
     const send = makeSend();
     await handleUpdate({ userId: '1', chatId: '111', topicId: null, text: 'hey', messageId: '9' }, { send });
@@ -39,7 +40,7 @@ describe('handleUpdate — access gate', () => {
   });
 
   it('non-owner non-allowlisted: refused, brain NOT called', async () => {
-    isOwner.mockReturnValue(false);
+    isTelegramOwner.mockReturnValue(false);
     const send = makeSend();
     await handleUpdate(
       { userId: '2', chatId: '111', topicId: null, text: 'hey', messageId: '9' },
@@ -50,7 +51,7 @@ describe('handleUpdate — access gate', () => {
   });
 
   it('/register from owner binds the chat', async () => {
-    isOwner.mockReturnValue(true);
+    isTelegramOwner.mockReturnValue(true);
     const { registerTelegramChat } = await import('../telegram/registry.js');
     const send = makeSend();
     await handleUpdate(
@@ -61,7 +62,7 @@ describe('handleUpdate — access gate', () => {
   });
 
   it('coding intent with no project binding: replies "register first", no brain coding', async () => {
-    isOwner.mockReturnValue(true);
+    isTelegramOwner.mockReturnValue(true);
     getTelegramProjectPath.mockReturnValue(null);
     generateResponseStreaming.mockResolvedValue({ text: 'chatty' });
     const send = makeSend();
