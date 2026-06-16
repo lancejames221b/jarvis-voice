@@ -5,7 +5,7 @@ import { getChannelModel } from '../channel-models.js';
 import { telegramChatKey, getTelegramProjectPath, registerTelegramChat } from './registry.js';
 import { getEngine, setEngine, resolveEngineEnv } from './engine.js';
 import { parseCommand } from './commands.js';
-import { terseStatus, detailBody } from './format.js';
+import { renderReply } from './format.js';
 import { createTransport } from './transport.js';
 import { transcribeVoiceNote } from './voice-in.js';
 import { buildAttachmentContext } from './attachments.js';
@@ -134,6 +134,7 @@ export async function handleUpdate(update, deps) {
       engineEnv: Object.keys(engineEnv).length ? engineEnv : null,
       model,
       discordChatHistory: history,
+      surfaceHint: 'telegram',
     });
     full = result?.text ?? '';
     pushHistory(chatKey, 'assistant', full);
@@ -147,28 +148,47 @@ export async function handleUpdate(update, deps) {
     aborters.delete(chatKey);
   }
 
-  const opts = topicId ? { topicId } : {};
+  const base = topicId ? { topicId } : {};
   if (brainFailed) {
-    await safeSend(send, chatId, '⚠️ engine error — try again or /engine claude', opts);
+    await safeSend(send, chatId, '⚠️ engine error — try again or /engine claude', base);
     return;
   }
-  // Deliver the reply. Each send is individually resilient (one retry on a
-  // transient EFATAL) and a failed chunk never aborts the rest.
-  await safeSend(send, chatId, terseStatus(full), opts);
-  for (const chunk of detailBody(full) || []) {
-    await safeSend(send, chatId, chunk, opts);
+  // Deliver the reply rendered for Telegram: rich HTML, with the plain-text
+  // rendering as a per-chunk fallback if Telegram rejects the markup. Each chunk
+  // is individually resilient (retry on transient EFATAL) and a failed chunk
+  // never aborts the rest.
+  const { html, plain } = renderReply(full);
+  for (let i = 0; i < html.length; i++) {
+    await safeSend(send, chatId, html[i], { ...base, parseMode: 'HTML' }, plain[i]);
   }
 }
 
-// Send a Telegram message, retrying once on a transient network failure
-// (node-telegram-bot-api surfaces these as "EFATAL: fetch failed"). Never
-// throws — a delivery failure is logged, not propagated, so it can't be
-// confused with an engine error or abort the remaining chunks.
-async function safeSend(send, chatId, text, opts) {
+// Send a Telegram message resiliently. Never throws — a delivery failure is
+// logged, not propagated, so it can't be confused with an engine error or abort
+// the remaining chunks. Recovery, in order:
+//   1. transient network failure ("EFATAL: fetch failed") → one retry
+//   2. HTML parse rejection (Telegram 400 on bad markup) → resend as plain text
+//      (when a `plainFallback` is provided)
+async function safeSend(send, chatId, text, opts, plainFallback) {
   try {
     await send(chatId, text, opts);
+    return;
   } catch (e) {
-    logger.warn({ err: e.message, chatId }, '[telegram-adapter] send failed, retrying once');
+    const msg = e.message || '';
+    // A parse/400 on the HTML path: drop parse_mode and send the plain rendering.
+    if (plainFallback !== undefined && (/can't parse|parse entities|400/i.test(msg))) {
+      logger.warn({ err: msg, chatId }, '[telegram-adapter] HTML rejected, sending plain text');
+      try {
+        const { parseMode: _drop, ...plainOpts } = opts || {};
+        await send(chatId, plainFallback, plainOpts);
+        return;
+      } catch (e2) {
+        logger.error({ err: e2.message, chatId }, '[telegram-adapter] plain fallback failed');
+        return;
+      }
+    }
+    // Otherwise treat as a transient network blip and retry once.
+    logger.warn({ err: msg, chatId }, '[telegram-adapter] send failed, retrying once');
     try {
       await send(chatId, text, opts);
     } catch (e2) {

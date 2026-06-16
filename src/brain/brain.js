@@ -1228,9 +1228,22 @@ export async function generateContextualInterim(userRequest) {
  * Used for @mention handling in Discord text channels.
  * Routes through the same gateway session but with a [TEXT] tag instead of [VOICE].
  */
+// A short surface-specific instruction prepended to the system prompt so the
+// agent shapes its reply for where it will be displayed. Telegram renders a
+// limited HTML subset (no headers/tables), so keep formatting light.
+function _surfaceInstruction(surfaceHint) {
+  if (surfaceHint === 'telegram') {
+    return 'You are replying in a Telegram chat. Keep formatting light: short '
+      + 'paragraphs, simple bullets, and inline `code` or fenced code blocks where '
+      + 'useful. Avoid Markdown headers (#), tables, and deep nesting — Telegram '
+      + 'cannot render them. Be concise and conversational.\n\n';
+  }
+  return '';
+}
+
 export async function generateTextResponse(userMessage, options = {}) {
   const channelId = options.channelId || _defaultTextChannel;
-  const textTag = resolvePrompt('text-channel.txt', {
+  const textTag = _surfaceInstruction(options.surfaceHint) + resolvePrompt('text-channel.txt', {
     VOICE_NAME,
     TEXT_CHANNEL_ID: channelId,
   });
@@ -1446,7 +1459,7 @@ If a prompt you receive begins with "[AUTONOMOUS LOOP" you are ALREADY inside th
 
 export async function generateTextResponseStreaming(userMessage, onChunk, options = {}) {
   const channelId = options.channelId || _defaultTextChannel;
-  const textTag = resolvePrompt("text-channel.txt", {
+  const textTag = _surfaceInstruction(options.surfaceHint) + resolvePrompt("text-channel.txt", {
     VOICE_NAME,
     TEXT_CHANNEL_ID: channelId,
   });

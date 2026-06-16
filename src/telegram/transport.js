@@ -54,10 +54,11 @@ export function normalizeUpdate(message) {
 }
 
 // Pure send helper: builds Telegram options and delegates to `sender`.
-export async function splitSend(sender, chatId, text, { topicId, replyTo } = {}) {
+export async function splitSend(sender, chatId, text, { topicId, replyTo, parseMode } = {}) {
   const opts = {};
   if (topicId) opts.message_thread_id = topicId;
   if (replyTo) opts.reply_to_message_id = replyTo;
+  if (parseMode) opts.parse_mode = parseMode;
   await sender(chatId, text, opts);
 }
 

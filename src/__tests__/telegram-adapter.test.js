@@ -231,4 +231,39 @@ describe('handleUpdate — access gate', () => {
     );
     expect(send.mock.calls.some(([, t]) => /engine error/i.test(t))).toBe(true);
   });
+
+  it('replies are sent as Telegram HTML (parse_mode), and the brain is told the surface', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'Done: **3 files** changed' });
+    const send = makeSend();
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, text: 'go', messageId: '9' },
+      { send },
+    );
+    // markdown was converted to HTML and sent with parse_mode:'HTML'
+    const [, sentText, sentOpts] = send.mock.calls[0];
+    expect(sentText).toContain('<b>3 files</b>');
+    expect(sentOpts.parseMode).toBe('HTML');
+    // the brain was told it's a telegram surface
+    expect(generateTextResponse.mock.calls[0][1].surfaceHint).toBe('telegram');
+  });
+
+  it('falls back to plain text when Telegram rejects the HTML markup', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'see **here**' });
+    // first (HTML) send 400s on a parse error; the plain resend succeeds
+    const send = vi.fn()
+      .mockRejectedValueOnce(new Error("Bad Request: can't parse entities"))
+      .mockResolvedValue(undefined);
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, text: 'go', messageId: '9' },
+      { send },
+    );
+    // the retry dropped parse_mode and sent plain text (no <b> tag, no asterisks)
+    const lastCall = send.mock.calls[send.mock.calls.length - 1];
+    expect(lastCall[1]).toContain('here');
+    expect(lastCall[1]).not.toContain('<b>');
+    expect(lastCall[1]).not.toContain('**');
+    expect(lastCall[2]?.parseMode).toBeUndefined();
+  });
 });
