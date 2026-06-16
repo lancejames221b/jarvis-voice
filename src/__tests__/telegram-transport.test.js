@@ -10,7 +10,7 @@ describe('normalizeUpdate', () => {
       text: 'hello',
     };
     expect(normalizeUpdate(msg)).toEqual({
-      userId: '555', chatId: '111', topicId: null, text: 'hello', messageId: '9',
+      userId: '555', chatId: '111', topicId: null, kind: 'text', text: 'hello', messageId: '9',
     });
   });
   it('captures a forum topic id when present', () => {
@@ -20,7 +20,17 @@ describe('normalizeUpdate', () => {
     };
     expect(normalizeUpdate(msg).topicId).toBe('222');
   });
-  it('returns null for a message with no text (e.g. a sticker)', () => {
+  it('normalizes a voice note to a kind:voice update with the file id', () => {
+    const msg = {
+      message_id: 9, from: { id: 555 }, chat: { id: 111 },
+      voice: { file_id: 'AAA-file', duration: 3 },
+    };
+    expect(normalizeUpdate(msg)).toEqual({
+      userId: '555', chatId: '111', topicId: null, messageId: '9',
+      kind: 'voice', fileId: 'AAA-file', duration: 3, caption: null,
+    });
+  });
+  it('returns null for an unhandled message type (e.g. a sticker)', () => {
     expect(normalizeUpdate({ message_id: 9, from: { id: 5 }, chat: { id: 1 } })).toBeNull();
   });
 });

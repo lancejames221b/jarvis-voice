@@ -76,4 +76,46 @@ describe('handleUpdate — access gate', () => {
     );
     expect(send).toHaveBeenCalled();
   });
+
+  it('voice note: downloads, transcribes, then routes the transcript to the brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'answer to spoken q' });
+    const send = makeSend();
+    const downloadFile = vi.fn().mockResolvedValue('/tmp/voice.oga');
+    const transcribeVoice = vi.fn().mockResolvedValue('what is the weather');
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'voice', fileId: 'F1', messageId: '9' },
+      { send, downloadFile, transcribeVoice },
+    );
+    expect(downloadFile).toHaveBeenCalledWith('F1', '/tmp');
+    expect(transcribeVoice).toHaveBeenCalledWith('/tmp/voice.oga');
+    // transcript is echoed back, then the brain reply is sent
+    expect(send.mock.calls.some(([, t]) => /what is the weather/.test(t))).toBe(true);
+    expect(generateTextResponse).toHaveBeenCalledWith('what is the weather', expect.any(Object));
+    expect(send).toHaveBeenCalledWith('111', 'answer to spoken q', expect.any(Object));
+  });
+
+  it('voice note that transcribes to empty: replies "couldn\'t make out", no brain', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    const send = makeSend();
+    const downloadFile = vi.fn().mockResolvedValue('/tmp/voice.oga');
+    const transcribeVoice = vi.fn().mockResolvedValue('');
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'voice', fileId: 'F1', messageId: '9' },
+      { send, downloadFile, transcribeVoice },
+    );
+    expect(generateTextResponse).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][1]).toMatch(/couldn.t make out|try again/i);
+  });
+
+  it('voice note when voice deps are absent: replies "not enabled", no download', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    const send = makeSend();
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, kind: 'voice', fileId: 'F1', messageId: '9' },
+      { send },
+    );
+    expect(generateTextResponse).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][1]).toMatch(/not enabled/i);
+  });
 });

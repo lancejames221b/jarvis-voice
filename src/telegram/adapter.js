@@ -7,6 +7,7 @@ import { getEngine, setEngine, resolveEngineEnv } from './engine.js';
 import { parseCommand } from './commands.js';
 import { terseStatus, detailBody } from './format.js';
 import { createTransport } from './transport.js';
+import { transcribeVoiceNote } from './voice-in.js';
 
 // per-chat in-memory live window (durability is the memory layer's job, not this)
 const histories = new Map();      // chatKey -> [{role, content}]
@@ -25,17 +26,42 @@ function pushHistory(chatKey, role, content) {
  * `deps.allowedUsers` is the tier-2 id list (strings).
  */
 export async function handleUpdate(update, deps) {
-  const { userId, chatId, topicId, text } = update;
+  const { userId, chatId, topicId } = update;
+  let { text } = update;
   const send = deps.send;
   const allowedUsers = deps.allowedUsers || [];
   const chatKey = telegramChatKey(chatId, topicId);
   const owner = isTelegramOwner(userId);
   const allowlisted = owner || allowedUsers.includes(String(userId));
-  logger.info({ userId, chatId, topicId, owner, allowlisted }, '[telegram] inbound');
+  logger.info({ userId, chatId, topicId, owner, allowlisted, kind: update.kind }, '[telegram] inbound');
 
   if (!allowlisted) {
     await send(chatId, 'not authorized', {});
     return;
+  }
+
+  // Voice note: download the OGG, transcribe via the Whisper-only STT path
+  // (no speaker gate), then treat the transcript as the message text.
+  if (update.kind === 'voice') {
+    if (!deps.downloadFile || !deps.transcribeVoice) {
+      await send(chatId, '🎤 voice messages are not enabled here', topicId ? { topicId } : {});
+      return;
+    }
+    let oggPath;
+    try {
+      oggPath = await deps.downloadFile(update.fileId, deps.tmpDir || '/tmp');
+    } catch (e) {
+      logger.error({ err: e.message, chatKey }, '[telegram] voice download failed');
+      await send(chatId, "⚠️ couldn't download that voice message", topicId ? { topicId } : {});
+      return;
+    }
+    text = await deps.transcribeVoice(oggPath);
+    if (!text) {
+      await send(chatId, "🎤 couldn't make out that voice message — try again?", topicId ? { topicId } : {});
+      return;
+    }
+    // Echo the transcript so the user sees what was heard.
+    await send(chatId, `🎤 “${text}”`, topicId ? { topicId } : {});
   }
 
   const cmd = parseCommand(text);
@@ -124,7 +150,12 @@ export function startTelegram() {
   if (!token) { logger.info('[telegram] no TELEGRAM_BOT_TOKEN — adapter not started'); return null; }
   const allowedUsers = (process.env.TELEGRAM_ALLOWED_USERS || '').split(',').map((s) => s.trim()).filter(Boolean);
   const transport = createTransport(token, (update) =>
-    handleUpdate(update, { send: (cid, text, opts) => transport.sendMessage(cid, text, opts), allowedUsers }));
+    handleUpdate(update, {
+      send: (cid, text, opts) => transport.sendMessage(cid, text, opts),
+      allowedUsers,
+      downloadFile: (fileId, dir) => transport.downloadFile(fileId, dir),
+      transcribeVoice: (oggPath) => transcribeVoiceNote(oggPath),
+    }));
   logger.info({ allowedUsers: allowedUsers.length }, '🛰️  Telegram adapter started');
   return transport;
 }

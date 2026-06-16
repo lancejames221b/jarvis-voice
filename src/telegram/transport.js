@@ -2,14 +2,30 @@ import TelegramBot from 'node-telegram-bot-api';
 import logger from '../logger.js';
 
 export function normalizeUpdate(message) {
-  if (!message || typeof message.text !== 'string') return null;
-  return {
+  if (!message) return null;
+  const base = {
     userId: String(message.from?.id ?? ''),
     chatId: String(message.chat?.id ?? ''),
     topicId: message.message_thread_id != null ? String(message.message_thread_id) : null,
-    text: message.text,
     messageId: String(message.message_id ?? ''),
   };
+  // Text message — the common case. kind:'text' for symmetry with voice.
+  if (typeof message.text === 'string') {
+    return { ...base, kind: 'text', text: message.text };
+  }
+  // Voice note — carry the file id so the adapter can download + transcribe.
+  // A spoken caption is rare on voice notes but pass it through if present.
+  if (message.voice && message.voice.file_id) {
+    return {
+      ...base,
+      kind: 'voice',
+      fileId: String(message.voice.file_id),
+      duration: message.voice.duration ?? null,
+      caption: typeof message.caption === 'string' ? message.caption : null,
+    };
+  }
+  // Anything else (sticker, photo, document, location, …) — not handled.
+  return null;
 }
 
 // Pure send helper: builds Telegram options and delegates to `sender`.
@@ -36,6 +52,8 @@ export function createTransport(token, onMessage) {
   const sender = (chatId, text, opts) => bot.sendMessage(chatId, text, opts);
   return {
     sendMessage: (chatId, text, opts = {}) => splitSend(sender, chatId, text, opts),
+    // Downloads a Telegram file (by file_id) into downloadDir; resolves to the saved path.
+    downloadFile: (fileId, downloadDir) => bot.downloadFile(fileId, downloadDir),
     stop: () => bot.stopPolling(),
   };
 }
