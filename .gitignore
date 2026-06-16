@@ -27,6 +27,7 @@ config.yml
 .gstack/
 JarvisBlade/
 .qwen/
+.qwen-runs/
 .pi/
 latest.jsonl
 continue.md
