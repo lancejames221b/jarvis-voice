@@ -7,7 +7,7 @@ vi.mock('../channel-access.js', () => ({
   canAccessChannel: vi.fn(),
 }));
 vi.mock('../brain/brain.js', () => ({
-  generateResponseStreaming: vi.fn(),
+  generateTextResponse: vi.fn(),
 }));
 vi.mock('../telegram/registry.js', () => ({
   telegramChatKey: (c, t) => (t ? `telegram:chat:${c}:topic:${t}` : `telegram:chat:${c}`),
@@ -21,7 +21,7 @@ vi.mock('../telegram/engine.js', () => ({
 }));
 
 import { isTelegramOwner } from '../channel-access.js';
-import { generateResponseStreaming } from '../brain/brain.js';
+import { generateTextResponse } from '../brain/brain.js';
 import { getTelegramProjectPath } from '../telegram/registry.js';
 import { handleUpdate } from '../telegram/adapter.js';
 
@@ -32,10 +32,13 @@ describe('handleUpdate — access gate', () => {
 
   it('owner plain chat: calls the brain and replies', async () => {
     isTelegramOwner.mockReturnValue(true);
-    generateResponseStreaming.mockResolvedValue({ text: 'hi there' });
+    generateTextResponse.mockResolvedValue({ text: 'hi there' });
     const send = makeSend();
     await handleUpdate({ userId: '1', chatId: '111', topicId: null, text: 'hey', messageId: '9' }, { send });
-    expect(generateResponseStreaming).toHaveBeenCalled();
+    expect(generateTextResponse).toHaveBeenCalled();
+    // Telegram chats must carry the agent:main: session key, not the global voice key.
+    const opts = generateTextResponse.mock.calls[0][1];
+    expect(opts.sessionUser).toBe('agent:main:telegram:chat:111');
     expect(send).toHaveBeenCalledWith('111', 'hi there', expect.any(Object));
   });
 
@@ -46,7 +49,7 @@ describe('handleUpdate — access gate', () => {
       { userId: '2', chatId: '111', topicId: null, text: 'hey', messageId: '9' },
       { send, allowedUsers: [] },
     );
-    expect(generateResponseStreaming).not.toHaveBeenCalled();
+    expect(generateTextResponse).not.toHaveBeenCalled();
     expect(send.mock.calls[0][1]).toMatch(/not authorized|read-only|denied/i);
   });
 
@@ -64,7 +67,7 @@ describe('handleUpdate — access gate', () => {
   it('coding intent with no project binding: replies "register first", no brain coding', async () => {
     isTelegramOwner.mockReturnValue(true);
     getTelegramProjectPath.mockReturnValue(null);
-    generateResponseStreaming.mockResolvedValue({ text: 'chatty' });
+    generateTextResponse.mockResolvedValue({ text: 'chatty' });
     const send = makeSend();
     // a plain message still routes to chat; binding only gates the *coding* path.
     await handleUpdate(

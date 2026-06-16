@@ -1,9 +1,9 @@
 import logger from '../logger.js';
 import { isTelegramOwner } from '../channel-access.js';
-import { generateResponseStreaming } from '../brain/brain.js';
+import { generateTextResponse } from '../brain/brain.js';
 import { getChannelModel } from '../channel-models.js';
 import { telegramChatKey, getTelegramProjectPath, registerTelegramChat } from './registry.js';
-import { getEngine, setEngine } from './engine.js';
+import { getEngine, setEngine, resolveEngineEnv } from './engine.js';
 import { parseCommand } from './commands.js';
 import { terseStatus, detailBody } from './format.js';
 import { createTransport } from './transport.js';
@@ -51,10 +51,22 @@ export async function handleUpdate(update, deps) {
   const controller = new AbortController();
   aborters.set(chatKey, controller);
   try {
-    const model = getChannelModel(chatKey) || undefined;
-    const result = await generateResponseStreaming(text, history, controller.signal, () => {}, {
-      model,
+    // Route through the lightweight text-channel path (NOT the voice path, which
+    // builds a 120K-char skills prompt and is hardwired to the global voice
+    // session). sessionUser carries the CLAUDE.md-shaped key so the gateway gives
+    // each chat/topic its own Claude session and strips the :topic: suffix for
+    // profile lookup. engineEnv applies the per-chat claude|qwen swap.
+    const engine = getEngine(chatKey);
+    const engineEnv = resolveEngineEnv(engine);
+    const model = engine === 'qwen'
+      ? engineEnv.model
+      : (getChannelModel(chatKey) || undefined);
+    const result = await generateTextResponse(text, {
+      sessionUser: `agent:main:${chatKey}`,
       channelId: chatKey,
+      engineEnv: Object.keys(engineEnv).length ? engineEnv : null,
+      model,
+      discordChatHistory: history,
     });
     const full = result?.text ?? '';
     pushHistory(chatKey, 'assistant', full);

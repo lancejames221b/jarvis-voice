@@ -1267,7 +1267,8 @@ export async function generateTextResponse(userMessage, options = {}) {
         messages,
         max_tokens: 8192,
         user: options.sessionUser || getActiveSessionUser(),
-        model: textModel,
+        model: options.model || textModel,
+        ...(options.engineEnv ? { engineEnv: options.engineEnv } : {}),
         ...THINKING_PARAM,
       }),
     }, undefined, channelId);
@@ -1484,8 +1485,9 @@ export async function generateTextResponseStreaming(userMessage, onChunk, option
         messages,
         max_tokens: 8192,
         user: options.sessionUser || getActiveSessionUser(),
-        model: textModel,
+        model: options.model || textModel,
         stream: true,
+        ...(options.engineEnv ? { engineEnv: options.engineEnv } : {}),
         ...THINKING_PARAM,
       }),
     }, undefined, channelId);
