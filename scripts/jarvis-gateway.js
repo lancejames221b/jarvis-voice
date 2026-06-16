@@ -79,10 +79,11 @@ let channelAccounts = loadChannelAccounts();
 
 function resolveProfile(channelKey) {
   if (!channelKey) return channelAccounts.profiles?.default ?? null;
-  // Try exact match first; then strip thread suffix so thread sessions inherit channel profile.
+  // Try exact match first; then strip thread/topic suffix so thread sessions
+  // (Discord :thread:) and Telegram :topic: sessions inherit their parent profile.
   let profileName = channelAccounts.channels?.[channelKey];
   if (!profileName) {
-    const parentKey = channelKey.replace(/:thread:\d+$/, "");
+    const parentKey = channelKey.replace(/:(thread|topic):\d+$/, "");
     if (parentKey !== channelKey) profileName = channelAccounts.channels?.[parentKey];
   }
   profileName = profileName || "default";
