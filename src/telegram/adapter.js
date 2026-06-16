@@ -65,21 +65,18 @@ export async function handleUpdate(update, deps) {
     await send(chatId, `🎤 “${text}”`, topicId ? { topicId } : {});
   }
 
-  // Image / document: download the file, build a prompt-context block (vision
-  // description for images, inlined/handed-off content for documents) and treat
-  // that as the message. The text-only brain can't see pixels, so the picture is
-  // turned into words here (src/telegram/vision.js + attachments.js).
+  // Image / document: download the file and hand the agent an @<abs-path>
+  // reference. `claude -p` reads @-referenced files as native input — real
+  // multimodal vision for images, direct read for documents — so the agent sees
+  // the actual file rather than a second-hand description (src/telegram/attachments.js).
   if (update.kind === 'image' || update.kind === 'document') {
     if (!deps.downloadFile) {
       await send(chatId, '📎 attachments are not enabled here', topicId ? { topicId } : {});
       return;
     }
-    // Documents land in the bound project dir so the agent can open them by path;
-    // images go to a temp dir (consumed by the vision call, not opened later).
-    const projectPath = getTelegramProjectPath(chatKey);
-    const dir = update.kind === 'document'
-      ? (projectPath || deps.tmpDir || '/tmp')
-      : (deps.tmpDir || '/tmp');
+    // Save into the bound project dir when there is one (stable, and the agent
+    // can re-open it with its own tools); otherwise a temp dir.
+    const dir = getTelegramProjectPath(chatKey) || deps.tmpDir || '/tmp';
     let savedPath;
     try {
       savedPath = await deps.downloadFile(update.fileId, dir);
@@ -88,17 +85,13 @@ export async function handleUpdate(update, deps) {
       await send(chatId, "⚠️ couldn't download that attachment", topicId ? { topicId } : {});
       return;
     }
-    if (update.kind === 'image') {
-      await send(chatId, '🖼️ looking at that image…', topicId ? { topicId } : {});
-    }
-    const ctx = await buildAttachmentContext({
+    const ctx = buildAttachmentContext({
       kind: update.kind,
       path: savedPath,
       fileName: update.fileName || savedPath.split('/').pop(),
-      mimeType: update.mimeType || null,
       caption: update.caption || null,
     });
-    // The brain message is the caption (the user's actual ask) plus the context.
+    // The brain message is the caption (the user's actual ask) plus the @ref.
     // With no caption, a neutral lead-in keeps the prompt well-formed.
     const lead = update.caption
       ? String(update.caption).trim()
@@ -122,6 +115,8 @@ export async function handleUpdate(update, deps) {
   const history = histories.get(chatKey);
   const controller = new AbortController();
   aborters.set(chatKey, controller);
+  let full;
+  let brainFailed = false;
   try {
     // Route through the lightweight text-channel path (NOT the voice path, which
     // builds a 120K-char skills prompt and is hardwired to the global voice
@@ -140,16 +135,45 @@ export async function handleUpdate(update, deps) {
       model,
       discordChatHistory: history,
     });
-    const full = result?.text ?? '';
+    full = result?.text ?? '';
     pushHistory(chatKey, 'assistant', full);
-    await send(chatId, terseStatus(full), topicId ? { topicId } : {});
-    const detail = detailBody(full);
-    if (detail) for (const chunk of detail) await send(chatId, chunk, topicId ? { topicId } : {});
   } catch (e) {
+    // ONLY a genuine brain/engine failure lands here. Telegram send failures are
+    // handled separately below so a transient network blip on a reply chunk is
+    // never mislabeled as an "engine error".
+    brainFailed = true;
     logger.error({ err: e.message, chatKey }, '[telegram-adapter] brain error');
-    await send(chatId, '⚠️ engine error — try again or /engine claude', {});
   } finally {
     aborters.delete(chatKey);
+  }
+
+  const opts = topicId ? { topicId } : {};
+  if (brainFailed) {
+    await safeSend(send, chatId, '⚠️ engine error — try again or /engine claude', opts);
+    return;
+  }
+  // Deliver the reply. Each send is individually resilient (one retry on a
+  // transient EFATAL) and a failed chunk never aborts the rest.
+  await safeSend(send, chatId, terseStatus(full), opts);
+  for (const chunk of detailBody(full) || []) {
+    await safeSend(send, chatId, chunk, opts);
+  }
+}
+
+// Send a Telegram message, retrying once on a transient network failure
+// (node-telegram-bot-api surfaces these as "EFATAL: fetch failed"). Never
+// throws — a delivery failure is logged, not propagated, so it can't be
+// confused with an engine error or abort the remaining chunks.
+async function safeSend(send, chatId, text, opts) {
+  try {
+    await send(chatId, text, opts);
+  } catch (e) {
+    logger.warn({ err: e.message, chatId }, '[telegram-adapter] send failed, retrying once');
+    try {
+      await send(chatId, text, opts);
+    } catch (e2) {
+      logger.error({ err: e2.message, chatId }, '[telegram-adapter] send failed after retry');
+    }
   }
 }
 

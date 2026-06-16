@@ -39,8 +39,6 @@ const YAML_TO_ENV = [
   ['telegram.token',        'TELEGRAM_BOT_TOKEN'],
   ['telegram.owner',        'TELEGRAM_OWNER_ID'],
   ['telegram.allowedUsers', 'TELEGRAM_ALLOWED_USERS'],
-  ['telegram.visionUrl',    'JARVIS_VISION_BASE_URL'],   // LM Studio host serving the vision model
-  ['telegram.visionModel',  'JARVIS_VISION_MODEL'],       // vision model id (default qwen/qwen3.6-35b-a3b)
 
   // gateway.*
   ['gateway.url',               'JARVIS_GATEWAY_URL'],

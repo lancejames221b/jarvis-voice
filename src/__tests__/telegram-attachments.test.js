@@ -1,75 +1,33 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-
-vi.mock('../logger.js', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+import { describe, it, expect } from 'vitest';
 
 import { buildAttachmentContext } from '../telegram/attachments.js';
 
 describe('buildAttachmentContext', () => {
-  beforeEach(() => vi.clearAllMocks());
-
-  it('describes an image and includes the description + caption', async () => {
-    const describe = vi.fn().mockResolvedValue('a cat on a keyboard');
-    const out = await buildAttachmentContext(
-      { kind: 'image', path: '/tmp/a.png', caption: 'who is this' },
-      { describe },
-    );
-    expect(describe).toHaveBeenCalledWith('/tmp/a.png', 'who is this');
-    expect(out).toContain('a cat on a keyboard');
+  it('references an image by @<abs-path> so claude -p reads it as vision input', () => {
+    const out = buildAttachmentContext({ kind: 'image', path: '/tmp/a.png', caption: 'who is this' });
+    expect(out).toContain('@/tmp/a.png');
+    expect(out).toMatch(/sent an image/i);
     expect(out).toContain('who is this');
   });
 
-  it('falls back to a path reference when vision returns nothing', async () => {
-    const describe = vi.fn().mockResolvedValue('');
-    const out = await buildAttachmentContext(
-      { kind: 'image', path: '/tmp/a.png', caption: '' },
-      { describe },
-    );
-    expect(out).toContain('/tmp/a.png');
-    expect(out).toContain('description was unavailable');
-  });
-
-  it('inlines a small text document in a code fence', async () => {
-    const read = vi.fn().mockResolvedValue(Buffer.from('hello=world\n'));
-    const out = await buildAttachmentContext(
-      { kind: 'document', path: '/proj/x.env', fileName: 'x.env', mimeType: 'text/plain', caption: null },
-      { read },
-    );
-    expect(out).toContain('x.env');
-    expect(out).toContain('```');
-    expect(out).toContain('hello=world');
-  });
-
-  it('hands off a large text document by path instead of inlining', async () => {
-    const big = Buffer.alloc(60_000, 0x61); // 60KB of 'a'
-    const read = vi.fn().mockResolvedValue(big);
-    const out = await buildAttachmentContext(
-      { kind: 'document', path: '/proj/big.log', fileName: 'big.log', mimeType: 'text/plain', caption: null },
-      { read },
-    );
-    expect(out).toContain('too large to inline');
-    expect(out).toContain('/proj/big.log');
-    expect(out).not.toContain('```');
-  });
-
-  it('hands off a non-text document (e.g. pdf) by path', async () => {
-    const read = vi.fn();
-    const out = await buildAttachmentContext(
-      { kind: 'document', path: '/proj/report.pdf', fileName: 'report.pdf', mimeType: 'application/pdf', caption: 'read this' },
-      { read },
-    );
-    expect(read).not.toHaveBeenCalled();
+  it('references a document by @<abs-path> with its filename', () => {
+    const out = buildAttachmentContext({
+      kind: 'document', path: '/proj/report.pdf', fileName: 'report.pdf', caption: 'read this',
+    });
+    expect(out).toContain('@/proj/report.pdf');
     expect(out).toContain('report.pdf');
-    expect(out).toContain('/proj/report.pdf');
+    expect(out).toMatch(/sent a file/i);
     expect(out).toContain('read this');
   });
 
-  it('recognizes a text doc by extension when mime is missing', async () => {
-    const read = vi.fn().mockResolvedValue(Buffer.from('console.log(1)'));
-    const out = await buildAttachmentContext(
-      { kind: 'document', path: '/proj/s.js', fileName: 's.js', mimeType: null, caption: null },
-      { read },
-    );
-    expect(read).toHaveBeenCalled();
-    expect(out).toContain('console.log(1)');
+  it('omits the note line when there is no caption', () => {
+    const out = buildAttachmentContext({ kind: 'image', path: '/tmp/a.png', caption: null });
+    expect(out).toContain('@/tmp/a.png');
+    expect(out).not.toMatch(/note about/i);
+  });
+
+  it('still produces a usable @ref when fileName is missing', () => {
+    const out = buildAttachmentContext({ kind: 'document', path: '/proj/x.bin', caption: '' });
+    expect(out).toContain('@/proj/x.bin');
   });
 });

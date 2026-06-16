@@ -123,32 +123,34 @@ describe('handleUpdate — access gate', () => {
     expect(send.mock.calls[0][1]).toMatch(/not enabled/i);
   });
 
-  it('image: downloads to tmp, builds vision context, routes caption+context to the brain', async () => {
+  it('image: downloads, builds an @ref context, routes caption+context to the brain', async () => {
     isTelegramOwner.mockReturnValue(true);
+    getTelegramProjectPath.mockReturnValue(null); // unbound chat → temp dir
     generateTextResponse.mockResolvedValue({ text: 'that is a cat' });
-    buildAttachmentContext.mockResolvedValue('\n\n[image desc: a cat]');
+    buildAttachmentContext.mockReturnValue('\n\n[open it with: @/tmp/photo.jpg]');
     const send = makeSend();
     const downloadFile = vi.fn().mockResolvedValue('/tmp/photo.jpg');
     await handleUpdate(
       { userId: '1', chatId: '111', topicId: null, kind: 'image', fileId: 'IMG1', caption: 'whats this', messageId: '9' },
       { send, downloadFile, tmpDir: '/tmp' },
     );
-    // images go to the temp dir, not the project dir
+    // unbound chat → image saved to the temp dir
     expect(downloadFile).toHaveBeenCalledWith('IMG1', '/tmp');
     expect(buildAttachmentContext).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'image', path: '/tmp/photo.jpg', caption: 'whats this' }),
     );
-    // brain gets the caption (the real ask) plus the vision context
+    // brain gets the caption (the real ask) plus the @ref context
     const prompt = generateTextResponse.mock.calls[0][0];
     expect(prompt).toContain('whats this');
-    expect(prompt).toContain('a cat');
+    expect(prompt).toContain('@/tmp/photo.jpg');
     expect(send).toHaveBeenCalledWith('111', 'that is a cat', expect.any(Object));
   });
 
   it('image with no caption: still routes a well-formed prompt to the brain', async () => {
     isTelegramOwner.mockReturnValue(true);
+    getTelegramProjectPath.mockReturnValue(null);
     generateTextResponse.mockResolvedValue({ text: 'ok' });
-    buildAttachmentContext.mockResolvedValue('\n\n[image desc: a chart]');
+    buildAttachmentContext.mockReturnValue('\n\n[open it with: @/tmp/p.png]');
     const send = makeSend();
     const downloadFile = vi.fn().mockResolvedValue('/tmp/p.png');
     await handleUpdate(
@@ -157,14 +159,14 @@ describe('handleUpdate — access gate', () => {
     );
     const prompt = generateTextResponse.mock.calls[0][0];
     expect(prompt).toMatch(/take a look at this image/i);
-    expect(prompt).toContain('a chart');
+    expect(prompt).toContain('@/tmp/p.png');
   });
 
-  it('document: downloads into the bound project dir and routes context to the brain', async () => {
+  it('document: downloads into the bound project dir and routes an @ref to the brain', async () => {
     isTelegramOwner.mockReturnValue(true);
     getTelegramProjectPath.mockReturnValue('/home/u/proj');
     generateTextResponse.mockResolvedValue({ text: 'reviewed' });
-    buildAttachmentContext.mockResolvedValue('\n\n[File: notes.md]\n```\nhi\n```');
+    buildAttachmentContext.mockReturnValue('\n\n[open it with: @/home/u/proj/notes.md]');
     const send = makeSend();
     const downloadFile = vi.fn().mockResolvedValue('/home/u/proj/notes.md');
     await handleUpdate(
@@ -175,7 +177,7 @@ describe('handleUpdate — access gate', () => {
     expect(downloadFile).toHaveBeenCalledWith('DOC1', '/home/u/proj');
     const prompt = generateTextResponse.mock.calls[0][0];
     expect(prompt).toContain('summarize');
-    expect(prompt).toContain('notes.md');
+    expect(prompt).toContain('@/home/u/proj/notes.md');
     expect(send).toHaveBeenCalledWith('111', 'reviewed', expect.any(Object));
   });
 
@@ -200,5 +202,33 @@ describe('handleUpdate — access gate', () => {
     );
     expect(generateTextResponse).not.toHaveBeenCalled();
     expect(send.mock.calls.some(([, t]) => /couldn.t download/i.test(t))).toBe(true);
+  });
+
+  it('a transient send failure (EFATAL) is retried, NOT reported as an engine error', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockResolvedValue({ text: 'real answer' });
+    // First send throws EFATAL (telegram network blip), retry succeeds.
+    const send = vi.fn()
+      .mockRejectedValueOnce(new Error('EFATAL: fetch failed'))
+      .mockResolvedValue(undefined);
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, text: 'hi', messageId: '9' },
+      { send },
+    );
+    // the brain succeeded, so the user must NOT see an engine-error message
+    expect(send.mock.calls.every(([, t]) => !/engine error/i.test(t))).toBe(true);
+    // the real answer was retried and delivered
+    expect(send.mock.calls.some(([, t]) => /real answer/.test(t))).toBe(true);
+  });
+
+  it('a genuine brain failure still surfaces an engine error', async () => {
+    isTelegramOwner.mockReturnValue(true);
+    generateTextResponse.mockRejectedValue(new Error('gateway 500'));
+    const send = makeSend();
+    await handleUpdate(
+      { userId: '1', chatId: '111', topicId: null, text: 'hi', messageId: '9' },
+      { send },
+    );
+    expect(send.mock.calls.some(([, t]) => /engine error/i.test(t))).toBe(true);
   });
 });
