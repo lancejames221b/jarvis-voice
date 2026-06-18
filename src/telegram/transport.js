@@ -59,7 +59,7 @@ export async function splitSend(sender, chatId, text, { topicId, replyTo, parseM
   if (topicId) opts.message_thread_id = topicId;
   if (replyTo) opts.reply_to_message_id = replyTo;
   if (parseMode) opts.parse_mode = parseMode;
-  await sender(chatId, text, opts);
+  return sender(chatId, text, opts);
 }
 
 // Live wiring. token from env; long-polls. onMessage receives a normalized update.
@@ -80,6 +80,9 @@ export function createTransport(token, onMessage) {
     sendMessage: (chatId, text, opts = {}) => splitSend(sender, chatId, text, opts),
     // Downloads a Telegram file (by file_id) into downloadDir; resolves to the saved path.
     downloadFile: (fileId, downloadDir) => bot.downloadFile(fileId, downloadDir),
+    sendChatAction: (chatId, opts = {}) => bot.sendChatAction(chatId, 'typing', opts),
+    editMessageText: (chatId, messageId, text, opts = {}) =>
+      bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts }),
     stop: () => bot.stopPolling(),
   };
 }

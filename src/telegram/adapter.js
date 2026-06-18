@@ -9,18 +9,12 @@ import { renderReply } from './format.js';
 import { createTransport } from './transport.js';
 import { transcribeVoiceNote } from './voice-in.js';
 import { buildAttachmentContext } from './attachments.js';
+import { loadHistory, pushHistory } from './history-store.js';
+import { startTyping } from './typing.js';
+import { isVerbose, setVerbose } from './verbose.js';
+import { createProgressDraft } from './progress.js';
 
-// per-chat in-memory live window (durability is the memory layer's job, not this)
-const histories = new Map();      // chatKey -> [{role, content}]
 const aborters = new Map();       // chatKey -> AbortController
-const HISTORY_CAP = 20;
-
-function pushHistory(chatKey, role, content) {
-  const h = histories.get(chatKey) || [];
-  h.push({ role, content });
-  while (h.length > HISTORY_CAP) h.shift();
-  histories.set(chatKey, h);
-}
 
 /**
  * Core update handler. `deps.send(chatId, text, opts)` sends a reply.
@@ -112,11 +106,26 @@ export async function handleUpdate(update, deps) {
   // Plain message: route to the brain (chat/status). Coding spawn is a follow-up
   // capability that rides the same gateway path; chat works with or without a binding.
   pushHistory(chatKey, 'user', text);
-  const history = histories.get(chatKey);
+  const history = loadHistory(chatKey);
   const controller = new AbortController();
   aborters.set(chatKey, controller);
   let full;
   let brainFailed = false;
+
+  // Start typing indicator so the user sees activity immediately
+  const stopTyping = startTyping({ sendAction: deps.sendChatAction, chatId, topicId });
+
+  let draft = null;
+  if (isVerbose(chatKey)) {
+    draft = createProgressDraft({
+      sendMessage: deps.send,
+      editMessage: deps.editMessageText,
+      chatId,
+      topicId,
+    });
+    draft.update('starting...');
+  }
+
   try {
     // Route through the lightweight text-channel path (NOT the voice path, which
     // builds a 120K-char skills prompt and is hardwired to the global voice
@@ -146,6 +155,11 @@ export async function handleUpdate(update, deps) {
     logger.error({ err: e.message, chatKey }, '[telegram-adapter] brain error');
   } finally {
     aborters.delete(chatKey);
+    stopTyping();
+    if (draft) {
+      draft.update('done');
+      try { await draft.finalize(); } catch { /* swallow */ }
+    }
   }
 
   const base = topicId ? { topicId } : {};
@@ -198,7 +212,7 @@ async function safeSend(send, chatId, text, opts, plainFallback) {
 }
 
 async function handleCommand(cmd, { chatKey, chatId, owner, send }) {
-  const ownerOnly = ['register', 'engine', 'model', 'cancel'];
+  const ownerOnly = ['register', 'engine', 'model', 'cancel', 'verbose'];
   if (ownerOnly.includes(cmd.cmd) && !owner) {
     await send(chatId, 'read-only: that command is owner-only', {});
     return;
@@ -220,13 +234,18 @@ async function handleCommand(cmd, { chatKey, chatId, owner, send }) {
       return;
     case 'status': {
       const path = getTelegramProjectPath(chatKey) || '(unbound)';
-      await send(chatId, `path: ${path} · engine: ${getEngine(chatKey)} · model: ${getChannelModel(chatKey) || 'default'}`, {});
+      await send(chatId, `path: ${path} · engine: ${getEngine(chatKey)} · model: ${getChannelModel(chatKey) || 'default'} · verbose: ${isVerbose(chatKey)}`, {});
       return;
     }
     case 'cancel': {
       const a = aborters.get(chatKey);
       if (a) a.abort();
       await send(chatId, 'cancelled', {});
+      return;
+    }
+    case 'verbose': {
+      setVerbose(chatKey, cmd.arg === 'on');
+      await send(chatId, `verbose: ${isVerbose(chatKey) ? 'on' : 'off'}`, {});
       return;
     }
     default:
@@ -242,6 +261,8 @@ export function startTelegram() {
   const transport = createTransport(token, (update) =>
     handleUpdate(update, {
       send: (cid, text, opts) => transport.sendMessage(cid, text, opts),
+      sendChatAction: transport.sendChatAction,
+      editMessageText: transport.editMessageText,
       allowedUsers,
       tmpDir: process.env.TELEGRAM_TMP_DIR || '/tmp',
       downloadFile: (fileId, dir) => transport.downloadFile(fileId, dir),

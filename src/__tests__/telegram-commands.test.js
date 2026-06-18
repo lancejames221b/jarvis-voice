@@ -20,6 +20,10 @@ describe('parseCommand', () => {
   it('parses /cancel with no arg', () => {
     expect(parseCommand('/cancel')).toEqual({ cmd: 'cancel', arg: null });
   });
+  it('parses /verbose on/off', () => {
+    expect(parseCommand('/verbose on')).toEqual({ cmd: 'verbose', arg: 'on' });
+    expect(parseCommand('/verbose off')).toEqual({ cmd: 'verbose', arg: 'off' });
+  });
   it('strips a bot @mention suffix Telegram adds in groups', () => {
     expect(parseCommand('/status@my_bot')).toEqual({ cmd: 'status', arg: null });
   });

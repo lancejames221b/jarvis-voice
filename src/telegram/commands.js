@@ -1,4 +1,4 @@
-const KNOWN = new Set(['register', 'engine', 'model', 'status', 'cancel']);
+const KNOWN = new Set(['register', 'engine', 'model', 'status', 'cancel', 'verbose']);
 
 export function parseCommand(text) {
   const t = String(text ?? '').trim();

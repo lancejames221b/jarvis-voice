@@ -22,6 +22,23 @@ vi.mock('../telegram/engine.js', () => ({
 vi.mock('../telegram/attachments.js', () => ({
   buildAttachmentContext: vi.fn(),
 }));
+vi.mock('../telegram/history-store.js', () => ({
+  loadHistory: vi.fn(() => []),
+  pushHistory: vi.fn(),
+}));
+vi.mock('../telegram/typing.js', () => ({
+  startTyping: vi.fn(() => vi.fn()),
+}));
+vi.mock('../telegram/verbose.js', () => ({
+  isVerbose: vi.fn(() => false),
+  setVerbose: vi.fn(),
+}));
+vi.mock('../telegram/progress.js', () => ({
+  createProgressDraft: vi.fn(() => ({
+    update: vi.fn(),
+    finalize: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
 
 import { isTelegramOwner } from '../channel-access.js';
 import { generateTextResponse } from '../brain/brain.js';
@@ -30,6 +47,19 @@ import { buildAttachmentContext } from '../telegram/attachments.js';
 import { handleUpdate } from '../telegram/adapter.js';
 
 function makeSend() { return vi.fn().mockResolvedValue(undefined); }
+
+function makeDeps(extra = {}) {
+  const send = makeSend();
+  const sendChatAction = vi.fn().mockResolvedValue(undefined);
+  const editMessageText = vi.fn().mockResolvedValue(undefined);
+  return {
+    send,
+    sendChatAction,
+    editMessageText,
+    allowedUsers: [],
+    ...extra,
+  };
+}
 
 describe('handleUpdate — access gate', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -48,22 +78,21 @@ describe('handleUpdate — access gate', () => {
 
   it('non-owner non-allowlisted: refused, brain NOT called', async () => {
     isTelegramOwner.mockReturnValue(false);
-    const send = makeSend();
+    const deps = makeDeps({ allowedUsers: [] });
     await handleUpdate(
       { userId: '2', chatId: '111', topicId: null, text: 'hey', messageId: '9' },
-      { send, allowedUsers: [] },
+      deps,
     );
     expect(generateTextResponse).not.toHaveBeenCalled();
-    expect(send.mock.calls[0][1]).toMatch(/not authorized|read-only|denied/i);
+    expect(deps.send.mock.calls[0][1]).toMatch(/not authorized|read-only|denied/i);
   });
 
   it('/register from owner binds the chat', async () => {
     isTelegramOwner.mockReturnValue(true);
     const { registerTelegramChat } = await import('../telegram/registry.js');
-    const send = makeSend();
     await handleUpdate(
       { userId: '1', chatId: '111', topicId: null, text: '/register /home/u/proj', messageId: '9' },
-      { send },
+      makeDeps(),
     );
     expect(registerTelegramChat).toHaveBeenCalledWith('telegram:chat:111', '/home/u/proj');
   });
@@ -72,13 +101,13 @@ describe('handleUpdate — access gate', () => {
     isTelegramOwner.mockReturnValue(true);
     getTelegramProjectPath.mockReturnValue(null);
     generateTextResponse.mockResolvedValue({ text: 'chatty' });
-    const send = makeSend();
     // a plain message still routes to chat; binding only gates the *coding* path.
+    const deps = makeDeps();
     await handleUpdate(
       { userId: '1', chatId: '111', topicId: null, text: 'just chatting', messageId: '9' },
-      { send },
+      deps,
     );
-    expect(send).toHaveBeenCalled();
+    expect(deps.send).toHaveBeenCalled();
   });
 
   it('voice note: downloads, transcribes, then routes the transcript to the brain', async () => {
