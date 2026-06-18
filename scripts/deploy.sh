@@ -56,8 +56,8 @@ if [[ $PULL -eq 1 ]]; then
   ssh "$REMOTE" "[ -d '$LIVE_PATH/.git' ]" || \
     die "Live path not a git repo on $REMOTE: $LIVE_PATH"
 
-  # Check for dirty tracked files on live (would block --ff-only).
-  DIRTY=$(ssh "$REMOTE" "git -C '$LIVE_PATH' status --porcelain -- . ':(exclude).env' ':(exclude)config.yaml' ':(exclude)*.local.*'" 2>/dev/null || true)
+  # Check for dirty TRACKED files on live (untracked files are fine; --ff-only only cares about tracked).
+  DIRTY=$(ssh "$REMOTE" "git -C '$LIVE_PATH' status --porcelain" 2>/dev/null | grep -v '^??' || true)
   if [[ -n "$DIRTY" ]]; then
     log "WARNING: live tree has uncommitted changes to tracked files:"
     echo "$DIRTY"
