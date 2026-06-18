@@ -934,11 +934,9 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
     const chatId = await getOrCreateChatId(channelKey);
 
-    // If we got a resumed chatId, release the lock immediately — no spawn-serialization
-    // is needed for resumes (claude already has history, no double-session risk).
-    if (chatId) {
-      releaseLock();
-    }
+    // Lock is held through the full Claude spawn for both new and resumed sessions.
+    // Resuming the same chatId concurrently causes multiple claude --resume processes
+    // to compete on the same session, each taking 8+ min and piling up indefinitely.
 
     // On a resumed session: re-inject the system prompt on every turn so Jarvis instructions
     // survive compaction. Claude already has full conversation history via --resume.
