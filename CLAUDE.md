@@ -1,5 +1,7 @@
 # OpenJarvis
 
+> **No PII in commits/code — HARD RULE.** Never put personal/identifying info (names, emails, phone numbers, Telegram/Discord numeric IDs, tokens, usernamed paths) into commit messages, code, or tracked files. Keep commit messages generalized and technical. All such data lives in config files (`config.yaml`, `.env`, registries) referenced via env/config, never hardcoded. Scan the staged diff and message before every commit.
+
 OpenJarvis is a Discord-native AI assistant that bridges voice I/O, Claude CLI agents, webhook alerts, and persistent memory. A user speaks or types in a Discord channel; Jarvis transcribes, routes to an AI agent session, and replies in text or voice.
 
 **Repo**: `~/Dev/openjarvis` (gamez dev), `~/dev/jarvis-voice/` on generic (live)
