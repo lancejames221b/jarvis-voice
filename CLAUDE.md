@@ -4,7 +4,7 @@
 
 OpenJarvis is a Discord-native AI assistant that bridges voice I/O, Claude CLI agents, webhook alerts, and persistent memory. A user speaks or types in a Discord channel; Jarvis transcribes, routes to an AI agent session, and replies in text or voice.
 
-**Repo**: `~/Dev/openjarvis` (gamez dev), `~/dev/jarvis-voice/` on generic (live)
+**Repo**: `~/Dev/openjarvis` (gamez dev), `~/dev/openjarvis/` on generic (live)
 **Package name**: `jarvis-voice` (rename to `openjarvis` is planned — see plan below)
 **Stack**: Node.js ES modules + discord.js v14 + Claude CLI + Python haivemind submodule
 
@@ -151,7 +151,10 @@ Channel accounts (which Claude `--config-path` to use per channel) are separate:
 
 ---
 
-## State Files (live, on generic via SSHFS at `~/mnt/generic/`)
+## State Files (live, on generic)
+
+Access via SSHFS at `~/Dev/generic/` (gamez) or directly at `~/.local/state/jarvis-voice/` on generic.
+Note: `~/mnt/generic/` is empty — the real SSHFS mount is `~/Dev/generic/`.
 
 | File | Purpose |
 |---|---|
@@ -166,27 +169,36 @@ Channel accounts (which Claude `--config-path` to use per channel) are separate:
 
 ## Deploy Workflow
 
-Code is authored and tested on gamez (`~/Dev/openjarvis`), then deployed to generic (`~/dev/jarvis-voice/` on generic) where the live services run. The SSHFS mount at `~/mnt/generic/` (on gamez) must be active for deploy and rollback operations.
+**Model: GitHub is the single source of truth.**
+- gamez authors code, commits, pushes to GitHub
+- generic pulls from GitHub and restarts services
+- No rsync, no SSHFS required for deploys
+
+```
+gamez  →  git push  →  GitHub  →  git pull --ff-only (generic)  →  systemctl restart
+```
 
 ### Deploy with `scripts/deploy.sh`
 
 ```bash
-# Full deploy to live (default target = generic)
+# Full deploy: push branch to GitHub, pull on generic, restart services
 scripts/deploy.sh
 
-# Explicit target
-scripts/deploy.sh generic
+# Push to GitHub only (no restart)
+scripts/deploy.sh --push-only
 
-# Dry-run — shows what would change, no restart, no writes
-scripts/deploy.sh dev
+# Pull + restart on generic only (already pushed)
+scripts/deploy.sh --pull-only
+
+# Dry-run — shows what would happen, makes no changes
+scripts/deploy.sh --dry-run
 ```
 
-The script does:
-1. Verifies the SSHFS mount at `$JARVIS_LIVE_MOUNT` (default `~/mnt/generic/dev/jarvis-voice`) is active (exits with error if not)
-2. Backs up the current live `src/`, `scripts/`, and `package.json` to `../jarvis-voice.bak/` (one generation kept)
-3. Rsyncs `src/`, `scripts/`, and `package.json` from dev to the SSHFS-mounted live path
-4. SSHes to generic and restarts both services: `systemctl --user restart jarvis-gateway jarvis-voice`
-5. Waits 3 seconds, checks `is-active` for both units, tails 60 lines of combined logs to confirm clean startup
+The script:
+1. Pushes current branch to `origin` (GitHub)
+2. Checks live tree on generic for dirty tracked files (would block `--ff-only`)
+3. `git pull --ff-only origin <branch>` on generic
+4. Restarts both services, waits 3s, checks `is-active`, tails startup logs
 
 ### Systemd services (on generic, `--user`)
 
@@ -218,17 +230,11 @@ ssh generic "journalctl --user -u jarvis-voice -u jarvis-gateway -b --no-pager |
 
 ### Rolling back a bad deploy
 
-`scripts/deploy.sh` saves the previous live state to `../jarvis-voice.bak/` before every deploy. To roll back:
+Since the live tree is a git checkout, rollback is a `git reset`:
 
 ```bash
-# Restore via SSHFS
-LIVE=~/mnt/generic/dev/jarvis-voice
-BAK=~/mnt/generic/dev/jarvis-voice.bak
-rsync -avz --delete "$BAK/src/"     "$LIVE/src/"
-rsync -avz --delete "$BAK/scripts/" "$LIVE/scripts/"
-cp "$BAK/package.json" "$LIVE/package.json"
-
-# Restart after rollback
+# Roll back one commit on generic
+ssh generic "cd /home/generic/dev/openjarvis && git reset --hard HEAD^"
 ssh generic "systemctl --user restart jarvis-gateway jarvis-voice"
 
 # Confirm
@@ -236,7 +242,7 @@ ssh generic "systemctl --user is-active jarvis-voice jarvis-gateway"
 ssh generic "journalctl --user -u jarvis-voice -u jarvis-gateway --since '20 seconds ago' --no-pager -n 40"
 ```
 
-Only one backup generation is kept — a subsequent deploy will overwrite `jarvis-voice.bak/`.
+To roll back to a specific commit: `git reset --hard <sha>` on generic.
 
 ---
 

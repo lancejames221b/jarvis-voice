@@ -1,73 +1,90 @@
 #!/usr/bin/env bash
-# Deploy OpenJarvis from dev (gamez) to live (generic).
-# Usage: scripts/deploy.sh [generic|dev]
-#   generic — full deploy + service restart (default)
-#   dev     — dry-run only, no changes
+# Deploy OpenJarvis from dev (gamez) to live (generic) via git pull.
 #
-# Deploys DIRECTLY over ssh to the live SSD path where systemd runs the
-# services (NOT via SSHFS — that mount maps to ~/dev/jarvis-voice which is a
-# DIFFERENT directory from the live WorkingDirectory and silently no-ops).
+# Usage:
+#   scripts/deploy.sh                  — full deploy: push local branch, pull on generic, restart
+#   scripts/deploy.sh --push-only      — push to GitHub only, no restart (CI/test use)
+#   scripts/deploy.sh --pull-only      — pull + restart on generic, no push (already pushed)
+#   scripts/deploy.sh --dry-run        — show what would happen, make no changes
+#
+# Model: GitHub is the single source of truth.
+#   gamez  → git push → GitHub → generic git pull --ff-only → systemctl restart
+#
+# Requirements:
+#   - Current branch is pushed to GitHub (or will be pushed by this script)
+#   - Live tree on generic is a clean git checkout (no local edits to tracked files)
+#   - .env and config files on generic are gitignored — they survive the pull untouched
 
 set -euo pipefail
 
-TARGET="${1:-generic}"
-SRC="${JARVIS_DEV_PATH:-$HOME/Dev/openjarvis}"
 REMOTE="${JARVIS_REMOTE:-generic}"
-# Live SSD path = systemd WorkingDirectory for jarvis-voice/jarvis-gateway on generic.
-LIVE="${JARVIS_LIVE_PATH:-/media/generic/8f6026e4-4fcd-4f37-8815-807fdcb8a4043/DEV/jarvis-voice}"
+LIVE_PATH="${JARVIS_LIVE_PATH:-/home/generic/dev/openjarvis}"
+BRANCH="$(git -C "$(dirname "$0")/.." rev-parse --abbrev-ref HEAD)"
 
-log() { echo "[deploy] $*"; }
-die() { echo "[deploy] ERROR: $*" >&2; exit 1; }
+log()  { echo "[deploy] $*"; }
+die()  { echo "[deploy] ERROR: $*" >&2; exit 1; }
+info() { echo "[deploy] $*"; }
 
-# Runtime state that lives under src/ but must NEVER be overwritten from dev.
-# src/data/ holds box-state.json, memory.md, task-ledger.json — all live state.
-SRC_EXCLUDES=(--exclude 'data/' --exclude '__tests__/')
+DRY=0
+PUSH=1
+PULL=1
 
-if [[ "$TARGET" == "dev" ]]; then
-  log "Dry run (no changes will be made) → $REMOTE:$LIVE"
-  rsync -avz --dry-run "${SRC_EXCLUDES[@]}" "$SRC/src/" "$REMOTE:$LIVE/src/"
-  rsync -avz --dry-run "$SRC/scripts/"     "$REMOTE:$LIVE/scripts/"
-  rsync -avz --dry-run "$SRC/package.json" "$REMOTE:$LIVE/package.json"
-  exit 0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)    DRY=1 ;;
+    --push-only)  PULL=0 ;;
+    --pull-only)  PUSH=0 ;;
+    *) die "Unknown argument: $arg" ;;
+  esac
+done
+
+# ── 1. Push to GitHub ─────────────────────────────────────────────────────────
+if [[ $PUSH -eq 1 ]]; then
+  log "Pushing branch '$BRANCH' to origin ..."
+  if [[ $DRY -eq 1 ]]; then
+    info "(dry-run) git push origin $BRANCH"
+  else
+    git -C "$(dirname "$0")/.." push origin "$BRANCH"
+  fi
 fi
 
-[[ "$TARGET" == "generic" ]] || die "Unknown target '$TARGET' — use 'generic' or 'dev'"
+# ── 2. Pull + restart on generic ──────────────────────────────────────────────
+if [[ $PULL -eq 1 ]]; then
+  log "Pulling on $REMOTE:$LIVE_PATH ..."
 
-# Confirm the live path exists on the remote before touching anything.
-ssh "$REMOTE" "[ -d '$LIVE/src' ]" || die "Live path not found on $REMOTE: $LIVE/src"
+  # Confirm live path exists.
+  ssh "$REMOTE" "[ -d '$LIVE_PATH/.git' ]" || \
+    die "Live path not a git repo on $REMOTE: $LIVE_PATH"
 
-# Backup current live for rollback (one generation, on the remote box).
-BAK="${LIVE}.bak"
-log "Backing up current live → $REMOTE:$BAK"
-ssh "$REMOTE" "mkdir -p '$BAK' && rsync -a --delete '$LIVE/src/' '$BAK/src/' && rsync -a --delete '$LIVE/scripts/' '$BAK/scripts/' && cp '$LIVE/package.json' '$BAK/package.json' 2>/dev/null || true"
+  # Check for dirty tracked files on live (would block --ff-only).
+  DIRTY=$(ssh "$REMOTE" "git -C '$LIVE_PATH' status --porcelain -- . ':(exclude).env' ':(exclude)config.yaml' ':(exclude)*.local.*'" 2>/dev/null || true)
+  if [[ -n "$DIRTY" ]]; then
+    log "WARNING: live tree has uncommitted changes to tracked files:"
+    echo "$DIRTY"
+    die "Aborting. Commit or stash on generic first, or use --push-only to inspect."
+  fi
 
-# Sync source over ssh directly to the live SSD path.
-# NOTE: NO --delete. Dev is a full mirror of code, but live may hold runtime
-# data/state files not tracked in dev; deleting them once crashed startup
-# (thread-router.js). Renames/removals must be cleaned up manually if needed.
-log "Syncing src/ → $REMOTE:$LIVE/src/ ..."
-rsync -avz "${SRC_EXCLUDES[@]}" "$SRC/src/" "$REMOTE:$LIVE/src/"
-log "Syncing scripts/ ..."
-rsync -avz "$SRC/scripts/" "$REMOTE:$LIVE/scripts/"
-log "Syncing package.json ..."
-rsync -avz "$SRC/package.json" "$REMOTE:$LIVE/package.json"
+  if [[ $DRY -eq 1 ]]; then
+    info "(dry-run) ssh $REMOTE 'git -C $LIVE_PATH pull --ff-only origin $BRANCH'"
+    info "(dry-run) ssh $REMOTE 'systemctl --user restart jarvis-gateway jarvis-voice'"
+  else
+    ssh "$REMOTE" "git -C '$LIVE_PATH' pull --ff-only origin '$BRANCH'"
 
-# Restart services.
-log "Restarting jarvis-gateway and jarvis-voice on $REMOTE ..."
-ssh "$REMOTE" "systemctl --user restart jarvis-gateway jarvis-voice"
+    log "Restarting jarvis-gateway and jarvis-voice on $REMOTE ..."
+    ssh "$REMOTE" "systemctl --user restart jarvis-gateway jarvis-voice"
 
-# Brief pause for startup.
-sleep 3
+    sleep 3
 
-# Verify.
-log "Checking service status ..."
-ssh "$REMOTE" "systemctl --user is-active jarvis-voice jarvis-gateway" || {
-  log "!!! A service is not active — recent logs:"
-  ssh "$REMOTE" "journalctl --user -u jarvis-voice -u jarvis-gateway --since '30 seconds ago' --no-pager -n 80"
-  die "Deploy completed but a service failed to start. Roll back with the .bak directory on $REMOTE."
-}
+    log "Checking service status ..."
+    if ! ssh "$REMOTE" "systemctl --user is-active jarvis-voice jarvis-gateway"; then
+      log "!!! A service failed to start — recent logs:"
+      ssh "$REMOTE" "journalctl --user -u jarvis-voice -u jarvis-gateway --since '30 seconds ago' --no-pager -n 80"
+      die "Services failed. Check logs above. Last git pull succeeded — rollback with: ssh $REMOTE 'cd $LIVE_PATH && git reset --hard HEAD^'"
+    fi
 
-# Tail logs.
-log "--- recent logs ---"
-ssh "$REMOTE" "journalctl --user -u jarvis-voice -u jarvis-gateway --since '15 seconds ago' --no-pager -n 60"
-log "Deploy complete."
+    log "--- startup logs ---"
+    ssh "$REMOTE" "journalctl --user -u jarvis-voice -u jarvis-gateway --since '15 seconds ago' --no-pager -n 60"
+  fi
+fi
+
+log "Done. Branch: $BRANCH → $REMOTE:$LIVE_PATH"
