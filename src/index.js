@@ -1422,14 +1422,18 @@ client.once('ready', async () => {
           text = `⚠️ Command failed: ${e.message.split('\n')[0]}`;
         }
       } else {
-        // LLM mode — use sched.model (default: haiku)
+        // LLM mode — use sched.model (default: haiku).
+        // Pass channelKey as `user` so the gateway applies the channel's MCP mode
+        // (e.g. full-MCP for #hud) rather than defaulting to no-tools mode.
         const model = sched.model || 'haiku';
+        const channelKey = sched.channelId ? `agent:main:discord:channel:${sched.channelId}` : null;
         const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_TOKEN}` },
           body: JSON.stringify({
             model,
             max_tokens: 512,
+            ...(channelKey ? { user: channelKey } : {}),
             messages: [{ role: 'user', content: sched.prompt }]
           })
         });
