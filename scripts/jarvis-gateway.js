@@ -16,12 +16,17 @@ const GATEWAY_TOKEN = process.env.JARVIS_GATEWAY_TOKEN || "";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
 // Logical model aliases — map short names to Anthropic model IDs.
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+const LMS_MODEL = process.env.JARVIS_LMS_MODEL || "qwen/qwen3.6-35b-a3b";
 const MODEL_ALIASES = {
-  claude:      process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  sonnet:      process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  opus:        process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
-  haiku:       "claude-haiku-4-5-20251001",
-  "opus-plan": process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  claude:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
+  sonnet:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
+  opus:            process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  haiku:           "claude-haiku-4-5-20251001",
+  "opus-plan":     process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  // qwen aliases resolve to the LM Studio model ID (engineEnvForModel sets the base URL)
+  "qwen":          LMS_MODEL,
+  "qwen-focused":  LMS_MODEL,
+  "qwen-fast":     LMS_MODEL,
 };
 // Strip a trailing -<effort> suffix to get the base alias, then add effort suffixes.
 EFFORT_LEVELS.forEach(l => {
