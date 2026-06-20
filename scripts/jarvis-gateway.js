@@ -51,14 +51,26 @@ function resolveModel(raw) {
 }
 const DEFAULT_CLAUDE_MODEL = resolveModel(process.env.DISPATCH_MODEL) || "claude-sonnet-4-6";
 
-// For the qwen alias, build an env overlay that routes claude -p to LM Studio.
-// Returns null for Claude aliases so callers can use: engineEnvForModel(m) || null
+// Qwen alias → LM Studio env overlay.
+// Temperature tiers:
+//   qwen            → 1.0 general/conversational (Jarvis default)
+//   qwen-focused    → 0.6 coding/precise (anti-loop sampling)
+//   qwen-fast       → 0.7 no-think fast responses
+// Temperature is stored in engineEnv.temperature for logging/future proxy use.
+// LM Studio currently uses its per-model default config for actual temp;
+// the alias documents intent and will drive a lightweight proxy when added.
+const QWEN_ALIASES = {
+  'qwen':         { temperature: 1.0, label: 'general' },
+  'qwen-focused': { temperature: 0.6, label: 'focused' },
+  'qwen-fast':    { temperature: 0.7, label: 'fast' },
+};
 function engineEnvForModel(alias) {
-  if (alias !== 'qwen') return null;
+  if (!alias || !QWEN_ALIASES[alias]) return null;
   const lmsBase = process.env.JARVIS_LMS_BASE_URL;
   if (!lmsBase) return null;
   const lmsModel = process.env.JARVIS_LMS_MODEL || 'qwen/qwen3.6-35b-a3b';
-  return { ANTHROPIC_BASE_URL: lmsBase, ANTHROPIC_AUTH_TOKEN: 'lmstudio', model: lmsModel };
+  const { temperature, label } = QWEN_ALIASES[alias];
+  return { ANTHROPIC_BASE_URL: lmsBase, ANTHROPIC_AUTH_TOKEN: 'lmstudio', model: lmsModel, temperature, label };
 }
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 const DEFAULT_REPORT_CHANNEL = process.env.DISCORD_REPORT_CHANNEL_ID || process.env.DISCORD_TEXT_CHANNEL_ID || "";
