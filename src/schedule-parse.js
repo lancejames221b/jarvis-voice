@@ -106,11 +106,74 @@ export function isScheduleIntent(text) {
 }
 
 /**
- * Full parse → schedule params. Resolves interval, duration→maxRuns,
- * "until <phrase>" termination, model override, and strips all of that
- * control language to leave the core monitoring prompt.
+ * Infer execution mode and shell command from the monitoring subject.
  *
- * Returns { intervalMs, maxRuns, terminationPhrase, model, prompt } or null.
+ * Returns { mode, shellCmd } where mode is 'shell' or 'llm'.
+ * When mode === 'shell', shellCmd is the command whose stdout will be fed
+ * to an LLM for interpretation (shell+LLM hybrid).
+ * When mode === 'llm', shellCmd is null.
+ */
+function _inferScheduleMode(prompt) {
+  // Torrent / qBittorrent / download monitoring
+  if (/torrent|qbt|qbittorrent|download(s|ing)?/i.test(prompt)) {
+    return {
+      mode: 'shell',
+      shellCmd: 'curl -s http://127.0.0.1:8080/api/v2/torrents/info',
+    };
+  }
+
+  // HTTP / URL reachability monitoring
+  const urlMatch = prompt.match(/https?:\/\/[^\s]+/i);
+  if (urlMatch) {
+    return {
+      mode: 'shell',
+      shellCmd: `curl -o /dev/null -s -w "%{http_code}" ${urlMatch[0]}`,
+    };
+  }
+
+  // Disk / memory / CPU
+  if (/\b(disk\s+space|disk\s+usage|free\s+space|storage|df\b)/i.test(prompt)) {
+    return { mode: 'shell', shellCmd: 'df -h' };
+  }
+  if (/\b(memory|ram|swap)\b/i.test(prompt)) {
+    return { mode: 'shell', shellCmd: 'free -h' };
+  }
+  if (/\b(cpu|load\s+avg(erage)?)\b/i.test(prompt)) {
+    return { mode: 'shell', shellCmd: "uptime && top -bn1 | head -5" };
+  }
+
+  // Process / service / daemon liveness
+  // e.g. "check if nginx is running", "is sshd alive", "monitor the cron service"
+  const procMatch = prompt.match(
+    /(?:check\s+(?:if\s+)?|is\s+|monitor\s+(?:the\s+)?|watch\s+(?:the\s+)?)(\w+)\s+(?:is\s+)?(?:running|up|alive|active)/i,
+  );
+  if (procMatch) {
+    const procName = procMatch[1];
+    return {
+      mode: 'shell',
+      shellCmd: `pgrep -a ${procName} && systemctl is-active ${procName} 2>/dev/null || echo "not found"`,
+    };
+  }
+  // Broader: "check/monitor process/service/daemon"
+  if (/\b(process|service|daemon)\b.*\b(running|alive|up|active)\b/i.test(prompt) ||
+      /\b(running|alive|up|active)\b.*\b(process|service|daemon)\b/i.test(prompt)) {
+    return { mode: 'shell', shellCmd: 'ps aux | head -20' };
+  }
+
+  // Default: LLM-only (no shell command)
+  return { mode: 'llm', shellCmd: null };
+}
+
+/**
+ * Full parse → schedule params. Resolves interval, duration→maxRuns,
+ * "until <phrase>" termination, model override, mode/shellCmd, and strips
+ * only interval/duration tokens to leave a meaningful monitoring prompt.
+ *
+ * Returns { intervalMs, maxRuns, terminationPhrase, model, mode, shellCmd, prompt, promptContext }
+ * or null if no schedule intent detected.
+ *
+ * promptContext (shell mode only) — the full LLM prompt template that the
+ * dispatch fn should use after prepending actual shell stdout.
  */
 export function parseScheduleRequest(text) {
   if (!text || !isScheduleIntent(text)) return null;
@@ -146,27 +209,66 @@ export function parseScheduleRequest(text) {
     }
   }
 
+  // Normalise common "done/finished/complete" variants to the sentinel 'DONE'
+  // so the dispatch fn can do a simple string comparison.
+  if (terminationPhrase) {
+    if (/^(all\s+)?(done|finished?|complete[d]?|through|success(ful)?)$/i.test(terminationPhrase)) {
+      terminationPhrase = 'DONE';
+    } else if (/^when\s+(all\s+)?(done|finished?|complete[d]?)/i.test(terminationPhrase)) {
+      terminationPhrase = 'DONE';
+    }
+  }
+  // Also catch bare "when finished/done/complete" patterns not caught by the
+  // until-match regex (e.g. "stop when done", "when all done").
+  if (!terminationPhrase) {
+    if (/\b(stop\s+when|when\s+(all\s+)?(done|finished?|complete[d]?))\b/i.test(text)) {
+      terminationPhrase = 'DONE';
+    }
+  }
+
   // Optional model override.
   const aliases = { haiku: 'haiku', sonnet: 'sonnet', opus: 'opus', 'claude-haiku': 'haiku', 'claude-sonnet': 'sonnet', 'claude-opus': 'opus' };
   const mm = text.match(/\busing\s+(haiku|sonnet|opus|claude-haiku|claude-sonnet|claude-opus)\b/i)
     || text.match(/\b(haiku|sonnet|opus):/i);
   const model = mm ? (aliases[mm[1].toLowerCase()] || 'haiku') : 'haiku';
 
-  // Strip control language to leave the core prompt.
+  // Strip ONLY scheduling control tokens — interval ("every 2 minutes"),
+  // duration ("for 5 minutes"), "until <phrase>", and model hints.
+  // Do NOT strip the monitoring verb or subject nouns.
   let prompt = text
     .replace(interval ? interval.matchText : '', '')
     .replace(duration ? duration.matchText : '', '')
     .replace(/\buntil\s+.+?(?:\.|$)/gi, '')
+    .replace(/\bwhen\s+(?:all\s+)?(?:done|finished?|complete[d]?)\b/gi, '')
+    .replace(/\bstop\s+when\s+(?:done|finished?|complete[d]?)\b/gi, '')
     .replace(/\busing\s+(haiku|sonnet|opus|claude-haiku|claude-sonnet|claude-opus)\b/gi, '')
     .replace(/\b(haiku|sonnet|opus):/gi, '')
     .replace(/^\s*(jarvis[,:]?\s+)/i, '')
     .replace(/^\s*(hey|ok|okay)[,:\s]+/i, '')
-    .replace(/^(please\s+)?(monitor|watch|keep an eye on|check|track|poll|ping|tail|observe|run|remind me to|remind me)\s+/i, 'monitor ')
-    .replace(/\bit\b/i, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
 
-  if (!prompt || prompt.toLowerCase() === 'monitor') prompt = text.trim();
+  // Fall back to the full original text if stripping left nothing useful.
+  if (!prompt || prompt.length < 3) prompt = text.trim();
 
-  return { intervalMs, maxRuns, terminationPhrase, model, prompt };
+  // Infer execution mode from the remaining meaningful prompt.
+  const { mode, shellCmd } = _inferScheduleMode(prompt);
+
+  // Build promptContext for shell+LLM hybrid mode.
+  // The dispatch fn prepends the actual shell stdout before this block.
+  let promptContext = null;
+  if (mode === 'shell') {
+    const doneClause = terminationPhrase === 'DONE'
+      ? ' If the condition is fully met (e.g. all torrents complete, service up, target reached), reply with exactly DONE on its own line.'
+      : '';
+    promptContext =
+      `[SHELL OUTPUT BELOW]\n` +
+      `Original request: ${prompt}\n` +
+      `Instructions: Analyze the shell output and summarize the current status concisely.${doneClause}`;
+  } else if (terminationPhrase === 'DONE') {
+    // LLM mode with a done-check: append instruction to the prompt itself.
+    prompt = `${prompt}. Reply with DONE when the condition is fully met.`;
+  }
+
+  return { intervalMs, maxRuns, terminationPhrase, model, mode, shellCmd, prompt, promptContext };
 }

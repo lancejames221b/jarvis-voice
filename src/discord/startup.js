@@ -200,10 +200,18 @@ export async function onReady(client, {
         }
       } else {
         const model = sched.model || 'haiku';
+        const channelKey = sched.channelId
+          ? `agent:main:discord:channel:${sched.channelId}${sched.threadId ? `:thread:${sched.threadId}` : ''}`
+          : null;
         const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_TOKEN}` },
-          body: JSON.stringify({ model, max_tokens: 512, messages: [{ role: 'user', content: sched.prompt }] }),
+          body: JSON.stringify({
+            model,
+            max_tokens: 512,
+            ...(channelKey ? { user: channelKey } : {}),
+            messages: [{ role: 'user', content: sched.prompt }]
+          }),
         });
         const data = await res.json();
         text = data?.choices?.[0]?.message?.content || '';
@@ -211,9 +219,6 @@ export async function onReady(client, {
       const _postTargetId = sched.threadId || sched.channelId;
       if (_postTargetId && text) {
         await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: _postTargetId });
-      }
-      if (sched.terminationPhrase && text.toLowerCase().includes(sched.terminationPhrase.toLowerCase())) {
-        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: _postTargetId });
       }
       return { text };
     } catch (err) {
