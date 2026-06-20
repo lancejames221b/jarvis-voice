@@ -90,7 +90,8 @@ const SESSION_STORE_PATH = process.env.SESSION_STORE_PATH || `${_defaultSessionD
 const CHANNEL_ACCOUNTS_PATH = process.env.CHANNEL_ACCOUNTS_PATH || `${_defaultSessionDir}/channel-accounts.json`;
 // Ensure the state directory exists (harmless if already present)
 try { fs.mkdirSync(_defaultSessionDir, { recursive: true }); } catch {}
-const CURSOR_AGENT_TIMEOUT_MS = 600_000; // 10 min — matches GATEWAY_TIMEOUT_MS in jarvis-voice
+const CURSOR_AGENT_TIMEOUT_MS = parseInt(process.env.GATEWAY_CLAUDE_TIMEOUT_MS || '600000');  // default 10 min
+const CURSOR_AGENT_TIMEOUT_LMS_MS = parseInt(process.env.GATEWAY_LMS_TIMEOUT_MS || '1800000'); // default 30 min for local models
 
 // ── Per-channel account profiles ─────────────────────────────────────────────
 // Maps channels to separate CLAUDE_CONFIG_DIR paths for multi-account routing.
@@ -380,10 +381,11 @@ function spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv 
   }
   const profile = resolveProfile(channelKey);
   if (profile?.configDir) cleanEnv.CLAUDE_CONFIG_DIR = profile.configDir;
-  log("claude_spawn", { model, chatId: chatId || null, channelKey, profile: profile?.label || "default", configDir: profile?.configDir || null });
+  const spawnTimeoutMs = (engineEnv?.ANTHROPIC_BASE_URL) ? CURSOR_AGENT_TIMEOUT_LMS_MS : CURSOR_AGENT_TIMEOUT_MS;
+  log("claude_spawn", { model, chatId: chatId || null, channelKey, profile: profile?.label || "default", configDir: profile?.configDir || null, timeoutMs: spawnTimeoutMs });
   const child = spawn(CLAUDE_BIN, args, {
     env: cleanEnv,
-    timeout: CURSOR_AGENT_TIMEOUT_MS,
+    timeout: spawnTimeoutMs,
     stdio: ["pipe", "pipe", "pipe"],
   });
   // Track the child BEFORE touching stdin so a throw on `.end()` (non-string prompt,
