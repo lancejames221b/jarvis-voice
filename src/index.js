@@ -1413,13 +1413,33 @@ client.once('ready', async () => {
     let text = '';
     try {
       if (sched.mode === 'shell' && sched.shellCmd) {
-        // Programmatic — run shell command directly, no LLM involved
         const { execSync } = await import('child_process');
+        let shellOut = '';
         try {
-          text = execSync(sched.shellCmd, { timeout: 15000, encoding: 'utf8' }).trim();
-          if (!text) text = '(no output)';
+          shellOut = execSync(sched.shellCmd, { timeout: 15000, encoding: 'utf8' }).trim();
+          if (!shellOut) shellOut = '(no output)';
         } catch (e) {
-          text = `⚠️ Command failed: ${e.message.split('\n')[0]}`;
+          shellOut = `command error: ${e.message.split('\n')[0]}`;
+        }
+        // If promptContext is set, feed shell output to haiku for intelligent analysis
+        if (sched.promptContext) {
+          const model = sched.model || 'haiku';
+          const channelKey = sched.channelId ? `agent:main:discord:channel:${sched.channelId}` : null;
+          const analysisPrompt = `${sched.promptContext}\n\n${shellOut}`;
+          const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_TOKEN}` },
+            body: JSON.stringify({
+              model,
+              max_tokens: 512,
+              ...(channelKey ? { user: channelKey } : {}),
+              messages: [{ role: 'user', content: analysisPrompt }]
+            })
+          });
+          const data = await res.json();
+          text = data?.choices?.[0]?.message?.content || shellOut;
+        } else {
+          text = shellOut;
         }
       } else {
         // LLM mode — use sched.model (default: haiku).
@@ -1443,9 +1463,6 @@ client.once('ready', async () => {
       const _postTargetId = sched.threadId || sched.channelId;
       if (_postTargetId && text) {
         await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: _postTargetId });
-      }
-      if (sched.terminationPhrase && text.toLowerCase().includes(sched.terminationPhrase.toLowerCase())) {
-        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: _postTargetId });
       }
       return { text };
     } catch (err) {
@@ -2661,10 +2678,11 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
     const _schedThreadId = _schedIsThread ? message.channelId : null;
 
     // Auto-detect whether this can run as a shell command (no LLM needed)
-    const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(corePrompt || content);
+    const { mode: _schedMode, shellCmd: _shellCmd, promptContext: _promptContext } = _inferScheduleMode(corePrompt || content);
 
     const sched = createSchedule({
       prompt: corePrompt || content,
+      promptContext: _promptContext || null,
       intervalMs,
       channelId: _schedParentId,
       threadId: _schedThreadId,
@@ -4803,9 +4821,10 @@ async function handleSpeech(userId, audioBuffer, preTranscribed = null) {
       markBotResponse(userId);
       try {
         const _postCh = focusChannelId || TEXT_CHANNEL_ID || VOICE_REPORT_CHANNEL_ID;
-        const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(dispatchResult.prompt);
+        const { mode: _schedMode, shellCmd: _shellCmd, promptContext: _promptContext } = _inferScheduleMode(dispatchResult.prompt);
         const sched = createSchedule({
           prompt: dispatchResult.prompt,
+          promptContext: _promptContext || null,
           intervalMs: dispatchResult.intervalMs,
           channelId: _postCh,
           threadId: null,
