@@ -25,6 +25,7 @@ const KNOWN_MODELS = [
   'sonnet', 'sonnet-high', 'sonnet-max',
   'opus', 'opus-high', 'opus-max', 'opus-plan',
   'haiku', 'haiku-low',
+  'qwen',
 ];
 
 function _persistModel(alias) {
@@ -112,6 +113,7 @@ const MODEL_CMD = new SlashCommandBuilder()
             { name: 'opus-plan (deep reasoning)', value: 'opus-plan' },
             { name: 'haiku (fast)', value: 'haiku' },
             { name: 'haiku-low (fastest)', value: 'haiku-low' },
+            { name: 'qwen (LM Studio)', value: 'qwen' },
           ))
       .addBooleanOption(opt =>
         opt.setName('global').setDescription('Change global default instead of pinning to this thread/channel')))

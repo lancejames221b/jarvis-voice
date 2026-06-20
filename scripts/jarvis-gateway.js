@@ -50,6 +50,16 @@ function resolveModel(raw) {
   return "";
 }
 const DEFAULT_CLAUDE_MODEL = resolveModel(process.env.DISPATCH_MODEL) || "claude-sonnet-4-6";
+
+// For the qwen alias, build an env overlay that routes claude -p to LM Studio.
+// Returns null for Claude aliases so callers can use: engineEnvForModel(m) || null
+function engineEnvForModel(alias) {
+  if (alias !== 'qwen') return null;
+  const lmsBase = process.env.JARVIS_LMS_BASE_URL;
+  if (!lmsBase) return null;
+  const lmsModel = process.env.JARVIS_LMS_MODEL || 'qwen/qwen3.6-35b-a3b';
+  return { ANTHROPIC_BASE_URL: lmsBase, ANTHROPIC_AUTH_TOKEN: 'lmstudio', model: lmsModel };
+}
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 const DEFAULT_REPORT_CHANNEL = process.env.DISCORD_REPORT_CHANNEL_ID || process.env.DISCORD_TEXT_CHANNEL_ID || "";
 const ALERT_WEBHOOK_TOKEN = process.env.ALERT_WEBHOOK_TOKEN || "";
@@ -955,7 +965,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
       let resolvedSessionId;
       try {
-        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, req.body?.engineEnv || null);
+        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
       } catch (streamError) {
         releaseLock();
         // Don't try to write to a closed/aborted socket.
@@ -983,7 +993,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
     }
 
     // Non-streaming path
-    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || null);
+    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
     setSession(channelKey, result.sessionId);
     releaseLock();
     res.json(openAiCompletionResponse(requestedModel, result.text));
@@ -1010,7 +1020,7 @@ app.post("/hooks/agent", requireAuth, async (req, res) => {
     let result;
     try {
       const chatId = await getOrCreateChatId(channelKey);
-      result = await callClaudeAgent(message, requestedModel, chatId, channelKey);
+      result = await callClaudeAgent(message, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
       if (channelKey && result?.sessionId) setSession(channelKey, result.sessionId);
     } catch (error) {
       const failure = `Task ${taskId || ""} failed: ${error.message || error}`.trim();
