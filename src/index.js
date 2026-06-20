@@ -2795,6 +2795,7 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
           sessionUser: _sessionUser,
           discordChatHistory,
           skipChannelContext: true,
+          model,
         });
         if (ac.signal.aborted) {
           verboseSessions.delete(_parentChannelId);
@@ -2827,12 +2828,16 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
 
   const _mentionAc = new AbortController();
   mentionSessions.set(_parentChannelId, _mentionAc);
+  // Per-channel model override — wins over global textModel
+  const { getChannelModel: _getMentionModel } = await import('./channel-models.js');
+  const _mentionModel = _getMentionModel(message.channelId) || _getMentionModel(message.channel?.parentId) || undefined;
   try {
     const result = await generateTextResponse(finalPrompt, {
       channelId: _parentChannelId,
       sessionUser: _sessionUser,
       discordChatHistory,
       skipChannelContext: true,
+      model: _mentionModel,
     });
 
     mentionSessions.delete(_parentChannelId);
