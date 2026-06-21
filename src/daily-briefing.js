@@ -47,7 +47,7 @@ async function fetchCalendarEvents() {
 async function fetchTrelloCards() {
   try {
     const cmd = `${resolveTilde(TRELLO_CLI)} ls "In Progress" -b openJarvis`;
-    const raw = execSync(cmd, { encoding: 'utf8', timeout: 15000 });
+    const raw = execSync(cmd, { encoding: 'utf8', timeout: 30000 });
     const lines = raw.split('\n')
       .map(l => l.trim())
       .filter(Boolean)
@@ -62,11 +62,19 @@ async function fetchTrelloCards() {
 
 async function fetchSchedules() {
   try {
-    const scheds = listSchedules().filter(s => s.enabled);
+    const scheds = listSchedules().filter(s => s.enabled && s.mode !== 'briefing');
     if (!scheds.length) return '**⏰ Active Schedules**\n_None._';
     const lines = scheds.slice(0, 8).map(s => {
-      const interval = Math.round(s.intervalMs / 60000);
-      return `- ${s.prompt.substring(0, 60)}${s.prompt.length > 60 ? '…' : ''} (every ${interval}m)`;
+      let suffix;
+      if (s.dailyAt) {
+        suffix = `(daily at ${s.dailyAt})`;
+      } else if (s.intervalMs && s.intervalMs > 0) {
+        const interval = Math.round(s.intervalMs / 60000);
+        suffix = `(every ${interval}m)`;
+      } else {
+        suffix = '';
+      }
+      return `- ${s.prompt.substring(0, 60)}${s.prompt.length > 60 ? '…' : ''} ${suffix}`.trimEnd();
     });
     return `**⏰ Active Schedules**\n${lines.join('\n')}`;
   } catch (err) {
