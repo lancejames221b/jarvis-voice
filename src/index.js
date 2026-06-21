@@ -1251,6 +1251,18 @@ client.on('messageUpdate', (_before, message) => {
   } catch {}
 });
 
+// Daily briefing scheduler helper — creates an 8am daily schedule that dispatches to briefing mode
+export const scheduleDailyBriefing = (channelId, hhmm = '08:00') => {
+  return createSchedule({
+    prompt: 'daily briefing',
+    mode: 'briefing',
+    dailyAt: hhmm,
+    channelId,
+    userId: 'system',
+    maxRuns: 0,
+  });
+};
+
 client.once('ready', async () => {
   logger.info(`🤖 Jarvis Voice Bot online as ${client.user.tag}`);
   logger.info(`📡 Guild: ${GUILD_ID} | Voice: ${VOICE_CHANNEL_ID} | Multi-user: ${MULTI_USER_ENABLED} | Callback: ${WEBHOOK_CALLBACK_MODE}`);
@@ -1412,6 +1424,16 @@ client.once('ready', async () => {
     const GATEWAY_TOKEN = process.env.JARVIS_GATEWAY_TOKEN || '';
     let text = '';
     try {
+      if (sched.mode === 'briefing') {
+        const { runDailyBriefing } = await import('./daily-briefing.js');
+        const result = await runDailyBriefing({
+          channelId: sched.channelId,
+          discordToken: process.env.DISCORD_TOKEN,
+          gatewayUrl: GATEWAY_URL,
+          gatewayToken: GATEWAY_TOKEN,
+        });
+        return { text: result.posted ? '(briefing posted)' : '' };
+      }
       if (sched.mode === 'shell' && sched.shellCmd) {
         const { execSync } = await import('child_process');
         let shellOut = '';
