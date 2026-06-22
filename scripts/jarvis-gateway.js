@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { WebSocketServer } from "ws";
+import { parseChannelKey } from "../src/comms/recipient.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -244,9 +245,10 @@ function _channelIsInAskMode(channelKey) {
   let state;
   try { state = JSON.parse(fs.readFileSync(ASK_MODE_FILE, "utf8")); } catch { return false; }
   // channelKey format: "agent:main:discord:channel:<id>[:thread:<tid>]"
-  const m = channelKey.match(/discord:channel:(\d+)(?::thread:(\d+))?/);
-  if (!m) return false;
-  const [, channelId, threadId] = m;
+  //                 or "agent:main:telegram:chat:<id>[:topic:<tid>]"
+  const parsed = parseChannelKey(channelKey);
+  if (!parsed) return false;
+  const { channelId, threadId } = parsed;
   // Thread-scoped first, then channel-scoped
   if (threadId && state[threadId] === true) return true;
   if (channelId && state[channelId] === true) return true;
@@ -267,9 +269,9 @@ function _channelMcpMode(channelKey) {
   if (channelKey.startsWith("task-agent:")) return { mode: "full" };
   let state;
   try { state = JSON.parse(fs.readFileSync(MCP_MODE_FILE, "utf8")); } catch { return { mode: "off" }; }
-  const m = channelKey.match(/discord:channel:(\d+)(?::thread:(\d+))?/);
-  if (!m) return { mode: "off" };
-  const [, channelId, threadId] = m;
+  const parsed = parseChannelKey(channelKey);
+  if (!parsed) return { mode: "off" };
+  const { channelId, threadId } = parsed;
   const raw = (threadId && state[threadId] !== undefined) ? state[threadId]
             : (channelId && state[channelId] !== undefined) ? state[channelId]
             : null;
