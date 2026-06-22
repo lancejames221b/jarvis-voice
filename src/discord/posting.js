@@ -10,6 +10,8 @@
 import logger from '../logger.js';
 import { getVisualTargetChannel } from '../visual-mode.js';
 import { discordRef } from '../state/runtime.js';
+import { send as commsSend } from '../comms/index.js';
+import { extractAttachmentsNeutral } from '../comms/attachments.js';
 
 // Env-based channel IDs — read at call time so they pick up env correctly
 function _textChannelId() { return process.env.DISCORD_TEXT_CHANNEL_ID; }
@@ -71,13 +73,15 @@ export async function postToTextChannel(message, options = {}) {
     }
     logger.info(`📤 Posting to ${channel.name} (${targetId})...`);
 
-    // Extract attachments when message is a plain string (cgg passes objects)
     if (typeof message === 'string') {
-      const { extractAttachments } = await import('./attachments.js');
-      const { cleanedText, files, dropped } = extractAttachments(message);
+      // String path: extract attachments neutrally, route through comms layer.
+      const { cleanedText, files } = extractAttachmentsNeutral(message);
       if (files.length) logger.info(`📎 attaching ${files.length} file(s) to ${channel.name}`);
-      await channel.send(files.length ? { content: cleanedText || '\u200b', files } : cleanedText);
+      const recipient = { surface: 'discord', kind: 'channel', id: targetId };
+      const out = { text: cleanedText, attachments: files };
+      await commsSend(recipient, out);
     } else {
+      // Object payloads stay on direct send until STEP 4 (cgg migration).
       await channel.send(message);
     }
 
@@ -120,7 +124,15 @@ export async function postActivity(message) {
   if (!ACTIVITY_FEED_ENABLED || !ACTIVITY_CHANNEL_ID || !client?.isReady()) return;
   try {
     const channel = client.channels.cache.get(ACTIVITY_CHANNEL_ID);
-    if (channel) return await channel.send(message);
+    if (channel) {
+      // All postActivity callers pass strings; route through comms layer.
+      // Object payloads stay on direct send until STEP 4 (cgg migration).
+      if (typeof message === 'string') {
+        const recipient = { surface: 'discord', kind: 'channel', id: ACTIVITY_CHANNEL_ID };
+        return await commsSend(recipient, { text: message });
+      }
+      return await channel.send(message);
+    }
   } catch (err) {
     logger.error('Activity post failed:', err.message);
   }

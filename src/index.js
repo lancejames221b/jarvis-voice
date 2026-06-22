@@ -77,6 +77,9 @@ import { setAskMode } from './channel-ask-mode.js';
 import { activate as muteQueueActivate, deactivate as muteQueueDeactivate, isActive as isMuteQueueActive, addEntry as muteQueueAdd, hasEntries as muteQueueHasEntries, getSummary as muteQueueSummary, getDebriefText as muteQueueDebrief, getContextBlock as muteQueueContext, clear as muteQueueClear, getCount as muteQueueCount } from './mute-queue.js';
 import logger from './logger.js';
 import { emit as busEmit } from './event-bus.js';
+import { discordRef } from './state/runtime.js';
+import { registerProvider } from './comms/index.js';
+import { makeDiscordProvider } from './comms/providers/discord.js';
 import {
   initDiscordMemory,
   maybeRecordDiscordMessage,
@@ -1335,6 +1338,16 @@ client.once('ready', async () => {
   switchChatterboxVoice(startupPersona.voice).catch(e => logger.warn(`[startup] chatterbox voice seed error: ${e.message}`));
 
   initAlertWebhook(client, GUILD_ID, ALLOWED_USERS, scheduleBriefingOnPause);
+
+  // ── Wire discordRef + comms DiscordProvider (Jarvis v2 §1 STEP 2) ──
+  // discordRef.client is read lazily by src/discord/posting.js at call time.
+  // We set it here — once the client is ready — so all posting.js guards work.
+  // The DiscordProvider is dependency-injected with the same live client reference
+  // so the comms layer can deliver messages without importing discord.js anywhere
+  // except providers/discord.js.
+  discordRef.client = client;
+  registerProvider('discord', makeDiscordProvider({ client }));
+  logger.info('[comms] DiscordProvider registered');
 
   // ── Inject Discord client + guild channel cache into focus-state ──
   try {
