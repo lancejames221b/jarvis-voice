@@ -978,12 +978,29 @@ export async function handleMentionReply(message, rawContent, isReplyToUs, audio
       return;
     }
 
-    const response = result.text;
-    if (response.length <= 2000) {
-      await message.reply(response);
+    // Extract any file attachments from the response text
+    const { extractAttachments } = await import('./attachments.js');
+    const { cleanedText, files, dropped } = extractAttachments(result.text);
+
+    // Guard: if cleanedText is empty AND no files, keep existing early-return behavior
+    if (!cleanedText && files.length === 0) {
+      logger.info(`@mention: empty response after attachment extraction (sub-agent likely spawned)`);
+      return;
+    }
+
+    if (files.length) logger.info(`📎 attaching ${files.length} file(s) to reply`);
+    for (const d of dropped) logger.info(`📎 skipped ${d.path}: ${d.reason}`);
+
+    const replyContent = cleanedText || null; // null → Discord sends files-only
+    if (cleanedText.length <= 2000) {
+      if (files.length) {
+        await message.reply(replyContent ? { content: cleanedText, files } : { files });
+      } else {
+        await message.reply(cleanedText);
+      }
     } else {
       const chunks = [];
-      let remaining = response;
+      let remaining = cleanedText;
       while (remaining.length > 0) {
         if (remaining.length <= 2000) { chunks.push(remaining); break; }
         let splitAt = remaining.lastIndexOf('\n\n', 2000);
@@ -992,13 +1009,17 @@ export async function handleMentionReply(message, rawContent, isReplyToUs, audio
         chunks.push(remaining.substring(0, splitAt));
         remaining = remaining.substring(splitAt).trimStart();
       }
-      await message.reply(chunks[0]);
+      if (files.length) {
+        await message.reply({ content: chunks[0], files });
+      } else {
+        await message.reply(chunks[0]);
+      }
       for (let i = 1; i < chunks.length; i++) {
         await message.channel.send(chunks[i]);
       }
     }
 
-    logger.info(`@mention: replied (${response.length} chars)`);
+    logger.info(`@mention: replied (${cleanedText.length} chars)`);
 
     const _mentionChan = sonosScopeKey(message.channel);
     if (isSonosModeEnabled(_mentionChan)) {

@@ -21,3 +21,7 @@ Quote the URL with double quotes to handle ampersands and other shell metacharac
 After the shell command returns (even with `&`), tell the user one line: "Opened on gamez." or "Opened on Mac." If they asked for something interactive on top of opening (e.g. "open this and tell me what's on the page"), also use the MCP tools after the Bash open to read/interact, or skip Bash and use MCP tools end-to-end.
 
 Only use the MCP chrome tab tools when the user explicitly wants Jarvis to DO something with the page — click, fill, scrape, summarize content, extract data. For "just open it for me", always use Bash+SSH.
+
+## Sharing Files and Screenshots
+
+To share a file or screenshot, write its full path on its own line (for example: /tmp/shot.png). It will be attached to your reply automatically. Do not use markdown image links for local files.

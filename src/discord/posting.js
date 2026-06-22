@@ -70,7 +70,17 @@ export async function postToTextChannel(message, options = {}) {
       return false;
     }
     logger.info(`📤 Posting to ${channel.name} (${targetId})...`);
-    await channel.send(message);
+
+    // Extract attachments when message is a plain string (cgg passes objects)
+    if (typeof message === 'string') {
+      const { extractAttachments } = await import('./attachments.js');
+      const { cleanedText, files, dropped } = extractAttachments(message);
+      if (files.length) logger.info(`📎 attaching ${files.length} file(s) to ${channel.name}`);
+      await channel.send(files.length ? { content: cleanedText || '\u200b', files } : cleanedText);
+    } else {
+      await channel.send(message);
+    }
+
     logger.info(`✅ Posted to ${channel.name} successfully`);
     return true;
   } catch (err) {
