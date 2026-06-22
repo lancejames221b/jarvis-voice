@@ -188,6 +188,47 @@ Every send consumer is enumerated so none is missed:
 | HUD (`src/discord/hud.js`) | `EmbedBuilder` | `OutMessage{embed:NeutralEmbed}`; `DiscordProvider` wraps to `EmbedBuilder` (first chunk only) |
 | Alert send paths (4 of 12 callbacks) | `setPostToTextCallback`/`setSpeakCallback`/`setPostActivityCallback`/`setPostToThreadCallback` | direct `comms.send(recipient, msg)`. **The other 8 callbacks stay** (control/state inversions, §3.5) |
 
+### 1.8 Progress / live-status — no more black holes (requirement: granular in-flight visibility)
+
+**The problem:** a long agent run (a `/spawn` thread, a multi-minute mention task, a kanban op) currently surfaces nothing for up to ~30 minutes, then dumps a single final report. The user wants an immediate acknowledgement plus **granular, edit-in-place progress** — "tool + intent summaries" ("reading the gateway", "running the test suite", "fixing the chunk logic") — rendered as **one live status message edited in place**, not a stream of new messages.
+
+**This is mostly unification of mechanisms that already exist**, promoted to a first-class comms concern:
+
+| Mechanism today | Where | Reused as |
+|---|---|---|
+| Pinned status-header edited `thinking→streaming→done`, crash-sweep on restart | `src/live-stream.js` (`createLiveStream`, `sweepOrphanedStreams`) | the Discord `Progress` renderer |
+| Editable throttled draft (2s coalesce) | `src/telegram/progress.js` (`createProgressDraft`) | the Telegram `Progress` renderer |
+| SSE `tool_use` events with "most-informative argument" extraction | `scripts/jarvis-gateway.js` (`streamClaudeToSSE`, ~`:590`) | the **source** of tool+intent summary lines |
+| Voice ack phrases (`getRandomCachedAck`) | `speech-output.js` | the voice `Progress` ack |
+
+**Design — `Progress` is a comms primitive, not a fourth output path.** Add to the comms layer a per-run progress handle the producer opens once and updates as events arrive; each provider renders it in its native idiom (Discord: one edited status message / the pinned live-stream header; Telegram: the edited draft; voice: a spoken ack + optional periodic "still working" if the run exceeds a threshold).
+
+```js
+// src/comms/progress.js
+/**
+ * @typedef {Object} ProgressHandle
+ * @property {(phase:string)=>void} ack          // immediate "on it: <phase>" — fires before first token
+ * @property {(line:string)=>void}  step         // a tool+intent summary line; throttled+coalesced per surface
+ * @property {(summary:OutMessage)=>Promise<void>} finish   // finalize: status becomes a permanent stamp, final reply posts
+ * @property {(reason:string)=>Promise<void>}      fail
+ */
+// comms.startProgress(recipient, caps) -> ProgressHandle
+//   - resolves the surface provider, opens its native live-status affordance
+//   - no-op-degrades when caps say the surface can't edit (posts a single ack instead of editing)
+```
+
+The **provider** owns rendering: `CommsProvider` gains an optional `startProgress(recipient, caps) => ProgressHandle`. Discord's implementation wraps `createLiveStream`; Telegram's wraps `createProgressDraft`; voice's speaks `ack` and, past a threshold, a throttled heartbeat. A provider without `startProgress` falls back to a one-shot ack message.
+
+**Tool+intent summary lines (the content).** The gateway already parses `tool_use` events and extracts the most-informative arg. Promote that into a compact human line per event: `Read src/comms/recipient.js` → "reading recipient.js"; `Bash npx vitest run` → "running the test suite"; `Edit chunk.js` → "fixing chunk.js". A small pure mapper `toolEventToIntent(toolName, arg)` (in `src/comms/progress-intent.js`, unit-tested) turns a `{toolName, arg}` into one short verb-phrase. The SSE consumer (the brain/spawn side that reads the gateway stream) calls `handle.step(toolEventToIntent(ev))` per dedup'd tool event. **Throttling lives in the provider** (coalesce to ~1 edit / 1.5–2s, mirroring `progress.js throttleMs` and Discord rate limits) so a burst of tool calls doesn't hit the edit rate limit.
+
+**Where producers open it.** The mention path (`message-handlers.js handleMentionReply`), `/spawn` (`agent/spawn.js`, `slash/spawn.js` — already uses `createLiveStream`, just re-pointed through `comms.startProgress`), and long kanban ops open a `ProgressHandle` at task start (`ack`), feed `step` lines from the gateway SSE stream, and `finish` with the final `OutMessage`. Short replies (sub-threshold, e.g. a non-streaming buffered answer under a few seconds) skip progress entirely — no status message for a 2-second reply.
+
+**Capability-gated.** `Capabilities` gains `canEditMessages` (discord/telegram true, voice false) and `progressStyle: 'edit'|'ack-only'|'speak'`. The renderer reads these so the same producer code does the right thing per surface with no branching at the call site. Behind `JARVIS_PROGRESS=1` for one deploy cycle (default current behavior) so it's a safe, reversible rollout — and because it changes what the user sees in-channel, it is a **user-noticeable UI change** subject to the wireframe + flag + sanctioned-list gate (see §6 rollout note).
+
+**Crash safety is inherited.** `sweepOrphanedStreams()` already patches orphaned "thinking" status messages on restart; the Telegram/voice renderers get the same treatment (a left-open draft is finalized to "interrupted — restarted" on boot) so a mid-run service restart never leaves a permanently-spinning status.
+
+**Migration:** lands as its own step (STEP 7.5, after TelegramProvider so both edit-capable surfaces exist), independent of the capability-prompt work. STEP -1…2 do not depend on it.
+
 ---
 
 ## 2. Env-aware capability + system-prompt layer
@@ -208,6 +249,8 @@ One flat typed descriptor, resolved at the single gateway spawn boundary where e
  * @property {boolean} canAttachFiles
  * @property {boolean} canThread
  * @property {boolean} canReact
+ * @property {boolean} canEditMessages        // discord/telegram: true; voice: false — drives live-status progress (§1.8)
+ * @property {'edit'|'ack-only'|'speak'} progressStyle  // how in-flight progress renders on this surface
  * @property {boolean} isVoice
  * @property {boolean} canReadFilePaths       // claude: true; qwen: false (files inlined as text)
  * @property {boolean} hasTools               // claude && mcp!=off && !askMode-write-block
@@ -437,6 +480,9 @@ Add `src/capabilities/{resolve.js, runtime-block.js}` (pure, vitest). Wire into 
 
 ### STEP 7 — TelegramProvider parity
 Add `src/comms/providers/telegram.js` wrapping the existing `createTransport()` injected sender + `splitSend()` (already ~90% shaped); route `telegram/adapter.js` replies through `comms.send()`. **Verify:** Telegram chat + forum topic + voice-note echo unchanged with a real message + image. Until this lands, Telegram keeps its own transport untouched (it already works).
+
+### STEP 7.5 — Progress / live-status primitive (no more black holes, §1.8)
+Add `src/comms/progress.js` (`startProgress` → `ProgressHandle`), `src/comms/progress-intent.js` (`toolEventToIntent`, pure + unit-tested), and `startProgress` on the Discord + Telegram providers (wrapping the existing `createLiveStream` / `createProgressDraft`). Add `canEditMessages` + `progressStyle` to `Capabilities`. Wire the mention path + `/spawn` to open a handle at task start (`ack`), feed `step` lines from the gateway SSE `tool_use` stream, `finish` with the final reply. Behind `JARVIS_PROGRESS=1` (default off). **Verify (live):** start a multi-step agent task in a Discord channel → an immediate ack appears, then one status message edits in place with tool+intent summaries ("running the test suite"…) as it works, then finalizes with the answer — no 30-minute black hole. Telegram draft edits identically. A normal short reply shows no status message (sub-threshold skip). Restart mid-run → orphaned status finalizes to "interrupted". **UI-change gate applies** (wireframe the status-message format + flag + sanctioned list before global flip).
 
 ### STEP 8 — VoiceProvider + spawn-thread + kanban consumers (FSM-aware)
 Add `src/comms/providers/voice.js` modeled against the real `audioQueue`/`_ttsDeliveryActive` FSM (§1.6). Route `_deliverSpeak`, spawn-thread streaming (`agent/spawn.js`, `slash/spawn.js`), and kanban-dispatch dual-output through `comms.send()`. **Verify (generic, GPU up):** wake-word → spoken reply with no double-speak over active task TTS; `/spawn` thread streams in order; a kanban verb both speaks and posts the board.
