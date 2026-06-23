@@ -93,6 +93,10 @@ const CHANNEL_ACCOUNTS_PATH = process.env.CHANNEL_ACCOUNTS_PATH || `${_defaultSe
 try { fs.mkdirSync(_defaultSessionDir, { recursive: true }); } catch {}
 const CURSOR_AGENT_TIMEOUT_MS = parseInt(process.env.GATEWAY_CLAUDE_TIMEOUT_MS || '600000');  // default 10 min
 const CURSOR_AGENT_TIMEOUT_LMS_MS = parseInt(process.env.GATEWAY_LMS_TIMEOUT_MS || '1800000'); // default 30 min for local models
+// Idle watchdog: kill the child if no stdout token arrives within this window.
+// Catches qwen stuck in PROCESSINGPROMPT and any model that accepts the request but never streams.
+// Lower than CURSOR_AGENT_TIMEOUT_MS so we fail fast rather than waiting the full timeout.
+const IDLE_WATCHDOG_MS = parseInt(process.env.GATEWAY_IDLE_WATCHDOG_MS || '90000'); // default 90s
 
 // ── Per-channel account profiles ─────────────────────────────────────────────
 // Maps channels to separate CLAUDE_CONFIG_DIR paths for multi-account routing.
@@ -580,9 +584,23 @@ async function callClaudeAgent(prompt, modelOverride, chatId, channelKey, engine
     const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv);
     let buf = "";
     let stderr = "";
+    let idleTimer = setTimeout(() => {
+      log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS, path: "non-streaming" });
+      try { child.kill("SIGKILL"); } catch {}
+    }, IDLE_WATCHDOG_MS);
+    idleTimer.unref();
     child.stderr.on("data", (d) => { stderr += d; });
-    child.stdout.on("data", (d) => { buf += d; });
+    child.stdout.on("data", (d) => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS, path: "non-streaming" });
+        try { child.kill("SIGKILL"); } catch {}
+      }, IDLE_WATCHDOG_MS);
+      idleTimer.unref();
+      buf += d;
+    });
     child.on("close", (code) => {
+      clearTimeout(idleTimer);
       const durationMs = Date.now() - start;
       let resultText = "";
       let sessionId = chatId || null;
@@ -609,7 +627,7 @@ async function callClaudeAgent(prompt, modelOverride, chatId, channelKey, engine
       log("claude_agent_done", { code, durationMs, model, chars: resultText.length });
       resolve({ text: resultText, model: `claude/${model}`, sessionId });
     });
-    child.on("error", (err) => { metrics.errors++; reject(err); });
+    child.on("error", (err) => { clearTimeout(idleTimer); metrics.errors++; reject(err); });
   });
 }
 
@@ -673,6 +691,20 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
     let lastTextLen = 0;  // tracks how many chars we've already forwarded as deltas
     const _seenToolIds = new Set();       // dedupe tool_use progress lines per request
     const _toolIdToName = new Map();      // tool_use_id → name, for result attribution
+
+    // Idle watchdog — kill child if no stdout arrives within IDLE_WATCHDOG_MS.
+    // Resets on every data chunk so a model actively streaming is never killed.
+    let idleTimer = null;
+    const resetIdleWatchdog = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (clientAborted) return;
+        log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS });
+        try { child.kill("SIGKILL"); } catch {}
+      }, IDLE_WATCHDOG_MS);
+      idleTimer.unref();
+    };
+    resetIdleWatchdog();
 
     // Client-disconnect handler — kill the cursor-agent child when the HTTP
     // client aborts the stream. Without this, aborted requests orphan the
@@ -762,6 +794,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
     }
 
     child.stdout.on("data", (chunk) => {
+      resetIdleWatchdog();
       lineBuf += chunk.toString();
       const lines = lineBuf.split("\n");
       lineBuf = lines.pop(); // hold incomplete last line
@@ -769,6 +802,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
     });
     child.stderr.on("data", () => {});
     child.on("close", (code) => {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       res.removeListener("close", onClose);
       if (clientAborted) return; // already rejected with "client disconnected"
       if (lineBuf.trim()) handleLine(lineBuf);
@@ -786,6 +820,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
       resolve(resolvedSessionId);
     });
     child.on("error", (err) => {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       res.removeListener("close", onClose);
       metrics.errors++;
       reject(err);
