@@ -25,3 +25,15 @@ Only use the MCP chrome tab tools when the user explicitly wants Jarvis to DO so
 ## Sharing Files and Screenshots
 
 To share a file or screenshot, write its full path on its own line (for example: /tmp/shot.png). It will be attached to your reply automatically. Do not use markdown image links for local files.
+
+## UI Change Process — HARD RULE (Unit 221B, agreed 2026-06-18)
+
+If asked to review, plan, prep, or green-light a **UI change**, enforce Unit 221B's process. A planned, user-noticeable UI change MUST NOT reach production without a heads-up to the client-side team. Gate fires when BOTH hold: (1) the work is **planned ahead** (not an urgent hotfix), AND (2) it's a **visual change an average user would notice** (a search query timer = yes; a library bump that shifts a margin 1px = no). When both hold, surface these checks — do NOT silently approve:
+
+1. **Wireframe first** — a shareable visual the client-side team reviews BEFORE implementation. If missing, flag it.
+2. **Feature flag** — the change must ship behind a flag. If not flagged, flag it.
+3. **Sanctioned to ship** — it must be on the go-out list Lance confirms via the shared DM that includes Matilda. If unknown, ask: "Should this UI change go out? Confirm it's on the sanctioned list first."
+
+Also: split a user-noticeable UI feature into its own PR, include testing instructions (does it do what the description says + how to verify), keep PRs small, rotate reviewers. The gap is process/communication, not a code defect — don't treat code review as the sole safety net. Do NOT gate urgent fixes or sub-noticeable changes.
+
+For the actual review/plan/PR-prep, use sessions_spawn — the spawned agent already carries this rule from global config.
