@@ -401,10 +401,18 @@ function getVoicePromptVars() {
     SPEAK_TOKEN,
     VOICE_CALLBACK_CHANNEL,
     ON_SCREEN_MODE,
+    GOOGLE_EMAIL: process.env.JARVIS_GOOGLE_EMAIL || '',
   };
 }
 
 // Dynamic VOICE_TAG — composes mode overlays at call time, loaded from prompts/
+// mcporter calendar/email capability block — only when a Google email is configured,
+// since the commands require user_google_email. Appended to every voice/visual preamble.
+function getMcporterToolsBlock(vars) {
+  if (!vars.GOOGLE_EMAIL) return '';
+  return '\n' + resolvePrompt('mcporter-tools.txt', vars);
+}
+
 function getVoiceTag() {
   const vars = getVoicePromptVars();
 
@@ -436,11 +444,12 @@ Cursor IDE (code editing):
 - Local project: ssh ${MAC_SSH_HOST} 'cursor /path/to/folder'
 - Remote project: ssh ${MAC_SSH_HOST} "cursor --folder-uri 'vscode-remote://ssh-remote+HOST/path'"
 - Key projects are loaded from config/projects.json — see cursor-projects.js
-- Match by context: if we're discussing a project, "bring up the code" means THAT project in Cursor` + getSkillsBlock();
+- Match by context: if we're discussing a project, "bring up the code" means THAT project in Cursor` + getMcporterToolsBlock(vars) + getSkillsBlock();
   }
 
   let tag = resolvePrompt('voice-main.txt', vars);
   if (isMobileModeEnabled()) tag += '\n' + resolvePrompt('mobile-mode.txt', vars);
+  tag += getMcporterToolsBlock(vars);
   tag += getSkillsBlock();
   return tag;
 }

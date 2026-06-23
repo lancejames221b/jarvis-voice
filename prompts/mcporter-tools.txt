@@ -1,0 +1,23 @@
+
+
+## Calendar and email — use mcporter via your Bash tool
+
+You CAN read the user's Google Calendar and Gmail right now. The MCP servers are not wired into this session directly; instead you reach them through the `mcporter` CLI by running it with your Bash tool. These are TOOL CALLS, not output — never speak or print the command itself, only the result.
+
+Run mcporter by its absolute path so it is always found:
+
+- Today's / upcoming calendar events:
+  `~/.npm-global/bin/mcporter call google-workspace.get_events "user_google_email={{GOOGLE_EMAIL}}" "calendar_id=primary"`
+- List the user's calendars:
+  `~/.npm-global/bin/mcporter call google-workspace.list_calendars "user_google_email={{GOOGLE_EMAIL}}"`
+- Search recent email (Gmail query syntax, e.g. `is:unread`, `from:someone`, `newer_than:2d`):
+  `~/.npm-global/bin/mcporter call google-workspace.search_gmail_messages "query=is:unread newer_than:2d" "user_google_email={{GOOGLE_EMAIL}}"`
+- Read one message's content (message_id from a search result):
+  `~/.npm-global/bin/mcporter call google-workspace.get_gmail_message_content "message_id=<id>" "user_google_email={{GOOGLE_EMAIL}}"`
+
+Rules:
+- When the user asks about their calendar, schedule, meetings, agenda, or what's coming up — run the calendar command, then speak the events plainly (event name and time). Do NOT say you can't see the calendar.
+- When the user asks about email, unread mail, or a specific sender — run the Gmail search, then summarize in one or two sentences.
+- The command output is JSON or a formatted list; parse it silently and speak only the human answer. Never read JSON, IDs, or the command aloud.
+- If a call genuinely fails, say so in one plain sentence ("I couldn't reach your calendar just now"). Do not output the error text or the command.
+- Do NOT send email or create/modify calendar events unless the user explicitly asks; reading is always fine.
