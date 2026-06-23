@@ -183,6 +183,20 @@ function saveCreatedAt() {
   try { fs.writeFileSync(SESSION_STORE_PATH + ".created", JSON.stringify(Object.fromEntries(channelCreatedAt))); }
   catch (e) { log("created_save_warn", { error: e.message }); }
 }
+// Per-channel engine label ("claude" | "qwen") the active session was created with.
+// Used to force a fresh session when the channel's model is switched across engines:
+// a `claude -p --resume <chatId>` reuses the ORIGINAL session's engine regardless of
+// the model flag, so switching a channel from qwen to sonnet (or back) must rotate the
+// session instead of resuming — otherwise the old engine sticks and ignores the change.
+const channelEngine = new Map(Object.entries(loadJsonFile(SESSION_STORE_PATH + ".engine")));
+function saveEngine() {
+  try { fs.writeFileSync(SESSION_STORE_PATH + ".engine", JSON.stringify(Object.fromEntries(channelEngine))); }
+  catch (e) { log("engine_save_warn", { error: e.message }); }
+}
+// Engine label for a requested model alias: "qwen" for any LM Studio alias, else "claude".
+function engineForModel(alias) {
+  return engineEnvForModel(alias) ? "qwen" : "claude";
+}
 
 // Prune sessions older than 30 days at startup to keep the store bounded.
 {
@@ -450,20 +464,29 @@ async function summarizeAndStoreChat(channelKey, oldChatId) {
 // Return an existing chatId for the channel, or create a new one.
 // Uses a per-channel Promise lock to prevent duplicate create-chat on concurrent requests.
 // Rotates automatically if turn count or age limits are exceeded.
-async function getOrCreateChatId(channelKey) {
+async function getOrCreateChatId(channelKey, requestedEngine = null) {
   if (channelKey && channelSessions.has(channelKey)) {
     const turns = channelTurns.get(channelKey) || 0;
     const age = Date.now() - (channelCreatedAt.get(channelKey) || 0);
-    if (turns >= CURSOR_MAX_TURNS_PER_CHAT || age > CURSOR_MAX_AGE_MS) {
+    // Engine switch (e.g. qwen → sonnet): a resumed session keeps its original engine,
+    // so a model change across engines must rotate rather than --resume the stale one.
+    const sessionEngine = channelEngine.get(channelKey) || null;
+    const engineChanged = requestedEngine != null && sessionEngine != null && sessionEngine !== requestedEngine;
+    if (turns >= CURSOR_MAX_TURNS_PER_CHAT || age > CURSOR_MAX_AGE_MS || engineChanged) {
       const oldChatId = channelSessions.get(channelKey);
-      log("chat_rotation", { channelKey, turns, ageMs: age, reason: turns >= CURSOR_MAX_TURNS_PER_CHAT ? "turns" : "age" });
-      // Summarize old session to haivemind (fire-and-forget, does not block rotation)
-      summarizeAndStoreChat(channelKey, oldChatId).catch(() => {});
+      const reason = engineChanged ? "engine_change"
+        : (turns >= CURSOR_MAX_TURNS_PER_CHAT ? "turns" : "age");
+      log("chat_rotation", { channelKey, turns, ageMs: age, reason, fromEngine: sessionEngine, toEngine: requestedEngine });
+      // Summarize old session to haivemind (fire-and-forget, does not block rotation).
+      // Skip on engine change: the old session may be the wedged one we're escaping,
+      // and resuming it to summarize would re-trigger the same hang.
+      if (!engineChanged) summarizeAndStoreChat(channelKey, oldChatId).catch(() => {});
       metrics.sessionsRotated++;
       channelSessions.delete(channelKey);
       channelTurns.delete(channelKey);
       channelCreatedAt.delete(channelKey);
-      saveSessions(); saveTurns(); saveCreatedAt();
+      channelEngine.delete(channelKey);
+      saveSessions(); saveTurns(); saveCreatedAt(); saveEngine();
     } else {
       metrics.sessionsResumed++;
       return channelSessions.get(channelKey);
@@ -475,13 +498,16 @@ async function getOrCreateChatId(channelKey) {
   return null;
 }
 
-function setSession(channelKey, sessionId) {
+function setSession(channelKey, sessionId, engine = null) {
   if (!channelKey || !sessionId) return;
   const prev = channelSessions.get(channelKey);
   const isNew = !channelSessions.has(channelKey);
   const isRotation = !isNew && prev && prev !== sessionId;
   channelSessions.set(channelKey, sessionId);
   channelTurns.set(channelKey, (channelTurns.get(channelKey) || 0) + 1);
+  // Record the engine this session was created/resumed under, so a later model
+  // switch across engines triggers rotation in getOrCreateChatId.
+  if (engine != null) { channelEngine.set(channelKey, engine); saveEngine(); }
   if (isNew) { channelCreatedAt.set(channelKey, Date.now()); saveCreatedAt(); }
   saveSessions(); saveTurns();
 
@@ -963,7 +989,8 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
       if (lockResolve) { lockResolve(); channelSessionLocks.delete(channelKey); lockResolve = null; }
     };
 
-    const chatId = await getOrCreateChatId(channelKey);
+    const requestedEngine = engineForModel(requestedModel);
+    const chatId = await getOrCreateChatId(channelKey, requestedEngine);
 
     // Lock is held through the full Claude spawn for both new and resumed sessions.
     // Resuming the same chatId concurrently causes multiple claude --resume processes
@@ -998,7 +1025,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
         return;
       }
 
-      setSession(channelKey, resolvedSessionId);
+      setSession(channelKey, resolvedSessionId, requestedEngine);
       releaseLock();
 
       res.write(`data: ${JSON.stringify({
@@ -1015,7 +1042,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
     // Non-streaming path
     const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
-    setSession(channelKey, result.sessionId);
+    setSession(channelKey, result.sessionId, requestedEngine);
     releaseLock();
     res.json(openAiCompletionResponse(requestedModel, result.text));
   } catch (error) {
@@ -1040,9 +1067,10 @@ app.post("/hooks/agent", requireAuth, async (req, res) => {
   queueMicrotask(async () => {
     let result;
     try {
-      const chatId = await getOrCreateChatId(channelKey);
+      const hookEngine = engineForModel(requestedModel);
+      const chatId = await getOrCreateChatId(channelKey, hookEngine);
       result = await callClaudeAgent(message, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
-      if (channelKey && result?.sessionId) setSession(channelKey, result.sessionId);
+      if (channelKey && result?.sessionId) setSession(channelKey, result.sessionId, hookEngine);
     } catch (error) {
       const failure = `Task ${taskId || ""} failed: ${error.message || error}`.trim();
       log("hooks_agent_error", { taskId, channelId, error: String(error.message || error) });
