@@ -97,6 +97,18 @@ const CURSOR_AGENT_TIMEOUT_LMS_MS = parseInt(process.env.GATEWAY_LMS_TIMEOUT_MS 
 // Catches qwen stuck in PROCESSINGPROMPT and any model that accepts the request but never streams.
 // Lower than CURSOR_AGENT_TIMEOUT_MS so we fail fast rather than waiting the full timeout.
 const IDLE_WATCHDOG_MS = parseInt(process.env.GATEWAY_IDLE_WATCHDOG_MS || '90000'); // default 90s
+// Stateless channels never use --resume. Every turn sends full collapsed history inline.
+// Context is preserved via brain.js foldHistory; no remote session reload overhead.
+const STATELESS_CHANNEL_IDS = new Set(
+  (process.env.JARVIS_STATELESS_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+function isStatelessChannel(channelKey) {
+  if (!channelKey) return false;
+  for (const id of STATELESS_CHANNEL_IDS) {
+    if (channelKey.includes(id)) return true;
+  }
+  return false;
+}
 
 // ── Per-channel account profiles ─────────────────────────────────────────────
 // Maps channels to separate CLAUDE_CONFIG_DIR paths for multi-account routing.
@@ -1025,15 +1037,17 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
     };
 
     const requestedEngine = engineForModel(requestedModel);
-    const chatId = await getOrCreateChatId(channelKey, requestedEngine);
+    // Stateless channels skip --resume entirely: full history arrives inline from brain.js
+    // foldHistory on every turn, so context is preserved without remote session reload overhead.
+    const stateless = isStatelessChannel(channelKey);
+    const chatId = stateless ? null : await getOrCreateChatId(channelKey, requestedEngine);
 
     // Lock is held through the full Claude spawn for both new and resumed sessions.
     // Resuming the same chatId concurrently causes multiple claude --resume processes
     // to compete on the same session, each taking 8+ min and piling up indefinitely.
 
-    // On a resumed session: re-inject the system prompt on every turn so Jarvis instructions
-    // survive compaction. Claude already has full conversation history via --resume.
-    // On a new session: send the full collapsed context (system + history + user message).
+    // Stateless / new session: send full collapsed context (system + history + user message).
+    // Resumed session: re-inject system prompt so Jarvis instructions survive compaction.
     const _sysMsg = (req.body?.messages || []).find(m => m?.role === "system");
     const _sysText = _sysMsg ? contentToText(_sysMsg.content) : "";
     const prompt = chatId
