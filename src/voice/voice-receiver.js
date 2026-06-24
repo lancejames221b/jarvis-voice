@@ -645,6 +645,13 @@ export async function joinChannel(voiceChannelId, options = {}) {
     }
 
     if (!userSpeaking.has(userId)) {
+      // Slide the conversation window forward the moment the owner starts speaking,
+      // not just when Jarvis finishes — so a slow response doesn't expire the window
+      // before the follow-up utterance is even processed.
+      if (ALLOWED_USERS.includes(userId)) {
+        markBotResponse(userId);
+      }
+
       const audioStream = receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_THRESHOLD_MS },
       });

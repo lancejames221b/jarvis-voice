@@ -6,7 +6,13 @@
  */
 
 import 'dotenv/config';
+// Hydrate process.env from the unified config.yaml AFTER .env (baseline) and
+// BEFORE any module reads process.env at top level. The gateway does the same
+// at its entry; the voice process needs it too so config.yaml values (e.g.
+// telegram.token -> TELEGRAM_BOT_TOKEN) reach startTelegram().
+import './config-env-bootstrap.js';
 import { Client, GatewayIntentBits } from 'discord.js';
+import { tryCggDispatch } from './cgg-dispatch.js';
 import {
   joinVoiceChannel,
   VoiceConnectionStatus,
@@ -31,6 +37,7 @@ import { classifyAmbient, isAmbientClassifierEnabled } from './brain/haiku-ambie
 import { startAlertWebhook, initAlertWebhook, setCurrentVoiceChannelId, setSpeakCallback, setMarkBotResponseCallback, setPostActivityCallback, setPostToTextCallback, hasPendingHandoffs, getPendingHandoffs, clearHandoffs, updateHealthState, endAllSessionPins, setDedupCallback, setDidTaskSpeakInlineCallback, setPersonaSwitchCallback, setPersonaCreateCallback, recordInlineSpoken, setCancelAllTasksCallback, setHandleFakeSttCallback } from './alert-webhook.js';
 import { createTask, markStreaming, markStreamDone, markWorking, markCompleted as ledgerMarkCompleted, markFailed, markEscalated, isJustAck, reconcileOnStartup, getOrphanedTasks, getPendingFollowups, processOrphans, getTask, TaskState } from './agent/task-ledger.js';
 import { initScheduler, createSchedule, listSchedules, deleteSchedule } from './task-scheduler.js';
+import { parseScheduleRequest } from './schedule-parse.js';
 import { storeTaskToHaivemind, getHaivemindContext, searchHaivemind, getChannelContext, storeChannelMemory } from './agent/session-manager.js';
 import { getTTSHealth } from './voice/tts.js';
 import { getSTTHealth, checkSttHealth } from './voice/stt.js';
@@ -48,6 +55,7 @@ import { getCurrentTtsProvider, getCurrentWakeWord } from './voice/tts-toggle.js
 import { isVerifiedOwner, passesAuthGate, enrollmentState } from './auth.js';
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete } from './slash-commands.js';
 import { handleSessionMessage, isSessionChannel } from './slash/session.js';
+import { detectLoopIntent, startLoopFromMessage, isLoopRunning, stopLoop } from './slash/loop.js';
 import { handleSessionSetup } from './session-setup.js';
 import { canAccessChannel, isOwner as isChannelOwner, OWNER_USER_ID } from './channel-access.js';
 import { setMcpAuthNotify } from './mcp-access.js';
@@ -69,6 +77,9 @@ import { setAskMode } from './channel-ask-mode.js';
 import { activate as muteQueueActivate, deactivate as muteQueueDeactivate, isActive as isMuteQueueActive, addEntry as muteQueueAdd, hasEntries as muteQueueHasEntries, getSummary as muteQueueSummary, getDebriefText as muteQueueDebrief, getContextBlock as muteQueueContext, clear as muteQueueClear, getCount as muteQueueCount } from './mute-queue.js';
 import logger from './logger.js';
 import { emit as busEmit } from './event-bus.js';
+import { discordRef } from './state/runtime.js';
+import { registerProvider } from './comms/index.js';
+import { makeDiscordProvider } from './comms/providers/discord.js';
 import {
   initDiscordMemory,
   maybeRecordDiscordMessage,
@@ -1193,6 +1204,19 @@ client.on('messageCreate', async (message) => {
 
   const content = (message.content || '').trim();
 
+  // H3-cgg: `!cgg <path> [filter] [hops]` or NL "call graph of <path>".
+  // Renders a cgg call graph to a PNG (inline) + attaches the raw .mmd.
+  // Intercepts before the brain; falls through when no cgg intent matches.
+  {
+    let cggBase;
+    try {
+      const { getKanbanPath } = await import('./state/focus-state.js');
+      cggBase = getKanbanPath?.(message.channelId) || undefined;
+    } catch {}
+    const cggRes = await tryCggDispatch(message, content, cggBase ? { base: cggBase } : {});
+    if (cggRes?.handled) return;
+  }
+
   // H4a: explicit /focus or /handoff — handle and return
   if (/^\/(handoff|focus)(\s|$)/i.test(content)) {
     return handleExplicitFocus(message, content);
@@ -1230,6 +1254,18 @@ client.on('messageUpdate', (_before, message) => {
   } catch {}
 });
 
+// Daily briefing scheduler helper — creates an 8am daily schedule that dispatches to briefing mode
+export const scheduleDailyBriefing = (channelId, hhmm = '08:00') => {
+  return createSchedule({
+    prompt: 'daily briefing',
+    mode: 'briefing',
+    dailyAt: hhmm,
+    channelId,
+    userId: 'system',
+    maxRuns: 0,
+  });
+};
+
 client.once('ready', async () => {
   logger.info(`🤖 Jarvis Voice Bot online as ${client.user.tag}`);
   logger.info(`📡 Guild: ${GUILD_ID} | Voice: ${VOICE_CHANNEL_ID} | Multi-user: ${MULTI_USER_ENABLED} | Callback: ${WEBHOOK_CALLBACK_MODE}`);
@@ -1239,6 +1275,10 @@ client.once('ready', async () => {
 
   // Start admin HTTP API for the dashboard (no-op if JARVIS_ADMIN_TOKEN unset)
   import('./admin-api.js').then(m => m.startAdminApi({ discordClient: client })).catch(e => logger.warn(`[admin-api] start error: ${e.message}`));
+
+  // Start the Telegram adapter — a peer transport on the same brain.
+  // No-ops without TELEGRAM_BOT_TOKEN; lazy-imported so its bot dep stays optional.
+  import('./telegram/adapter.js').then(m => m.startTelegram()).catch(e => logger.warn(`[telegram] start error: ${e.message}`));
 
   // Patch any live-stream messages left in "thinking" state by a prior crash
   import('./live-stream.js').then(m => m.sweepOrphanedStreams()).catch(e => logger.warn(`[live-stream] sweep error: ${e.message}`));
@@ -1298,6 +1338,16 @@ client.once('ready', async () => {
   switchChatterboxVoice(startupPersona.voice).catch(e => logger.warn(`[startup] chatterbox voice seed error: ${e.message}`));
 
   initAlertWebhook(client, GUILD_ID, ALLOWED_USERS, scheduleBriefingOnPause);
+
+  // ── Wire discordRef + comms DiscordProvider (Jarvis v2 §1 STEP 2) ──
+  // discordRef.client is read lazily by src/discord/posting.js at call time.
+  // We set it here — once the client is ready — so all posting.js guards work.
+  // The DiscordProvider is dependency-injected with the same live client reference
+  // so the comms layer can deliver messages without importing discord.js anywhere
+  // except providers/discord.js.
+  discordRef.client = client;
+  registerProvider('discord', makeDiscordProvider({ client }));
+  logger.info('[comms] DiscordProvider registered');
 
   // ── Inject Discord client + guild channel cache into focus-state ──
   try {
@@ -1387,35 +1437,67 @@ client.once('ready', async () => {
     const GATEWAY_TOKEN = process.env.JARVIS_GATEWAY_TOKEN || '';
     let text = '';
     try {
+      if (sched.mode === 'briefing') {
+        const { runDailyBriefing } = await import('./daily-briefing.js');
+        const result = await runDailyBriefing({
+          channelId: sched.channelId,
+          discordToken: process.env.DISCORD_TOKEN,
+          gatewayUrl: GATEWAY_URL,
+          gatewayToken: GATEWAY_TOKEN,
+        });
+        return { text: result.posted ? '(briefing posted)' : '' };
+      }
       if (sched.mode === 'shell' && sched.shellCmd) {
-        // Programmatic — run shell command directly, no LLM involved
         const { execSync } = await import('child_process');
+        let shellOut = '';
         try {
-          text = execSync(sched.shellCmd, { timeout: 15000, encoding: 'utf8' }).trim();
-          if (!text) text = '(no output)';
+          shellOut = execSync(sched.shellCmd, { timeout: 15000, encoding: 'utf8' }).trim();
+          if (!shellOut) shellOut = '(no output)';
         } catch (e) {
-          text = `⚠️ Command failed: ${e.message.split('\n')[0]}`;
+          shellOut = `command error: ${e.message.split('\n')[0]}`;
+        }
+        // If promptContext is set, feed shell output to haiku for intelligent analysis
+        if (sched.promptContext) {
+          const model = sched.model || 'haiku';
+          const channelKey = sched.channelId ? `agent:main:discord:channel:${sched.channelId}` : null;
+          const analysisPrompt = `${sched.promptContext}\n\n${shellOut}`;
+          const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_TOKEN}` },
+            body: JSON.stringify({
+              model,
+              max_tokens: 512,
+              ...(channelKey ? { user: channelKey } : {}),
+              messages: [{ role: 'user', content: analysisPrompt }]
+            })
+          });
+          const data = await res.json();
+          text = data?.choices?.[0]?.message?.content || shellOut;
+        } else {
+          text = shellOut;
         }
       } else {
-        // LLM mode — use sched.model (default: haiku)
+        // LLM mode — use sched.model (default: haiku).
+        // Pass channelKey as `user` so the gateway applies the channel's MCP mode
+        // (e.g. full-MCP for #hud) rather than defaulting to no-tools mode.
         const model = sched.model || 'haiku';
+        const channelKey = sched.channelId ? `agent:main:discord:channel:${sched.channelId}` : null;
         const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GATEWAY_TOKEN}` },
           body: JSON.stringify({
             model,
             max_tokens: 512,
+            ...(channelKey ? { user: channelKey } : {}),
             messages: [{ role: 'user', content: sched.prompt }]
           })
         });
         const data = await res.json();
         text = data?.choices?.[0]?.message?.content || '';
       }
-      if (sched.channelId && text) {
-        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: sched.channelId });
-      }
-      if (sched.terminationPhrase && text.toLowerCase().includes(sched.terminationPhrase.toLowerCase())) {
-        await postToTextChannel(`✅ Schedule \`${sched.id}\` condition met — stopped.`, { forceChannelId: sched.channelId });
+      const _postTargetId = sched.threadId || sched.channelId;
+      if (_postTargetId && text) {
+        await postToTextChannel(`**[Schedule \`${sched.id}\`]** ${text}`, { forceChannelId: _postTargetId });
       }
       return { text };
     } catch (err) {
@@ -2131,7 +2213,20 @@ async function buildDiscordContextFromApi(message, limit = 10) {
         const isMe = m.author.bot && m.author.username === myUsername;
         const who = isMe ? 'You (assistant)' : m.author.username;
         const body = (m.content || '').substring(0, 400).replace(/\n/g, ' ');
-        return `${who}: ${body}`;
+        const attachParts = [];
+        if (m.attachments?.size) {
+          for (const a of m.attachments.values()) {
+            const ct = a.contentType?.split(';')[0]?.trim() || '';
+            const ext = a.name?.split('.').pop()?.toLowerCase() || '';
+            const isImage = ct.startsWith('image/') || ['png','jpg','jpeg','gif','webp'].includes(ext);
+            if (ct === 'audio/ogg' || a.url?.endsWith('.ogg')) continue;
+            attachParts.push(isImage
+              ? `[Image attachment: ${a.url}]`
+              : `[file: ${a.name} — ${a.url}]`);
+          }
+        }
+        const suffix = attachParts.length ? (body ? ' ' : '') + attachParts.join(' ') : '';
+        return `${who}: ${body}${suffix}`;
       })
       .join('\n');
 
@@ -2580,71 +2675,64 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
     return { mode: 'llm', shellCmd: null };
   }
 
+  // ── Natural-language "stop loop" — cancel an auto-loop running in this thread ──
+  if (message.channel?.isThread?.() && isLoopRunning(message.channelId)
+      && /\b(stop|cancel|end|kill|halt)\b.{0,15}\bloop(ing)?\b/i.test(content)) {
+    stopLoop(message.channelId);
+    await message.reply('🛑 Loop stopped.');
+    return;
+  }
+
+  // ── Natural-language auto-loop ("keep …ing until done", "loop on X", …) ──
+  // Self-judged with a hard iteration cap, runs in an auto-created thread.
+  // Checked BEFORE the scheduler so "until done" phrasing isn't misrouted;
+  // detectLoopIntent() returns null for fixed-interval "every N" phrasing,
+  // which falls through to the scheduler below.
+  {
+    const _loopIntent = detectLoopIntent(content);
+    if (_loopIntent) {
+      logger.info(`[auto-loop] detected loop intent: "${_loopIntent.prompt.substring(0, 80)}" (model=${_loopIntent.model})`);
+      await startLoopFromMessage(message, _loopIntent, (msg) => message.reply(msg));
+      return;
+    }
+  }
+
   // ── Scheduler intent dispatch (RECURRING_CHECK / LIST_SCHEDULES / DELETE_SCHEDULE) ──
   const _lowerContent = content.toLowerCase();
-  const _isRecurringCheck =
-    /every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/i.test(content) &&
-    /(check|monitor|watch|run|poll|ping|test)\b/i.test(content);
+  const _schedReq = parseScheduleRequest(content);
   const _isListSchedules = /\b(list|show|what)\b.{0,30}\bschedules?\b/i.test(content) ||
     /\bschedules?\s+(are\s+)?(running|active|pending)\b/i.test(content);
   const _isDeleteSchedule = /\b(stop|cancel|remove|delete)\b.{0,30}\bschedule\b/i.test(content);
 
-  if (_isRecurringCheck) {
-    const intervalMatch = content.match(/every\s+(\d+)\s*(second|minute|hour|min|sec|s|m|h)s?/i);
-    let intervalMs = 5 * 60 * 1000;
-    if (intervalMatch) {
-      const n = parseInt(intervalMatch[1]);
-      const unit = intervalMatch[2].toLowerCase();
-      if (unit.startsWith('s')) intervalMs = n * 1000;
-      else if (unit.startsWith('m')) intervalMs = n * 60 * 1000;
-      else if (unit.startsWith('h')) intervalMs = n * 60 * 60 * 1000;
-    }
-    // "until X" — phrase-based termination
-    const untilMatch = content.match(/until\s+(.+?)(?:\.|$)/i);
-    let terminationPhrase = untilMatch ? untilMatch[1].trim() : null;
+  if (_schedReq) {
+    const { intervalMs, maxRuns, terminationPhrase, model: _schedModel, prompt: corePrompt } = _schedReq;
 
-    // "for the next N hours/minutes" — compute maxRuns from total duration
-    let maxRuns = 0;
-    const forMatch = content.match(/for\s+(?:the\s+next\s+)?(\d+)\s*(second|minute|hour|min|sec|s|m|h)s?/i);
-    if (forMatch) {
-      const n = parseInt(forMatch[1]);
-      const u = forMatch[2].toLowerCase();
-      let durationMs;
-      if (u.startsWith('s')) durationMs = n * 1000;
-      else if (u.startsWith('m')) durationMs = n * 60 * 1000;
-      else if (u.startsWith('h')) durationMs = n * 60 * 60 * 1000;
-      maxRuns = Math.max(1, Math.floor(durationMs / intervalMs));
-      // If "until phrase" was something like "until an hour", clear it — duration wins
-      if (terminationPhrase && /^\d+\s*(hour|minute|min|second|sec|h|m|s)/i.test(terminationPhrase)) {
-        terminationPhrase = null;
-      }
-    }
-
-    const corePrompt = content
-      .replace(/every\s+\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
-      .replace(/for\s+(?:the\s+next\s+)?\d+\s*(second|minute|hour|min|sec|s|m|h)s?/gi, '')
-      .replace(/until\s+.+?(?:\.|$)/gi, '')
-      .replace(/^(check|monitor|watch|run|ping|poll)\s+/i, '')
-      .trim();
+    // Post results back to the thread if scheduled from one
+    const _schedIsThread = message.channel?.isThread?.();
+    const _schedParentId = _schedIsThread ? (message.channel.parentId || message.channelId) : message.channelId;
+    const _schedThreadId = _schedIsThread ? message.channelId : null;
 
     // Auto-detect whether this can run as a shell command (no LLM needed)
-    const { mode: _schedMode, shellCmd: _shellCmd } = _inferScheduleMode(corePrompt || content);
+    const { mode: _schedMode, shellCmd: _shellCmd, promptContext: _promptContext } = _inferScheduleMode(corePrompt || content);
 
     const sched = createSchedule({
       prompt: corePrompt || content,
+      promptContext: _promptContext || null,
       intervalMs,
-      channelId: message.channelId,
+      channelId: _schedParentId,
+      threadId: _schedThreadId,
       userId: message.author.id,
       terminationPhrase,
       maxRuns,
       mode: _schedMode,
-      model: 'haiku',   // LLM schedules always use haiku
+      model: _schedModel,
       shellCmd: _shellCmd,
     });
     const humanInterval = intervalMs < 60000 ? `${intervalMs/1000}s` : `${intervalMs/60000}m`;
     const suffix = terminationPhrase ? ` until "${terminationPhrase}"` : maxRuns > 0 ? ` (${maxRuns} runs)` : '';
-    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ' 🤖 haiku';
-    await message.reply(`✅ Scheduled — will run every ${humanInterval}${suffix}${modeTag}. ID: \`${sched.id}\``);
+    const modeTag = _schedMode === 'shell' ? ' ⚡ shell' : ` 🤖 ${_schedModel}`;
+    const threadTag = _schedThreadId ? ' (replies here)' : '';
+    await message.reply(`✅ Scheduled — every ${humanInterval}${suffix}${modeTag}${threadTag}. ID: \`${sched.id}\``);
     return;
   }
 
@@ -2742,6 +2830,7 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
           sessionUser: _sessionUser,
           discordChatHistory,
           skipChannelContext: true,
+          model,
         });
         if (ac.signal.aborted) {
           verboseSessions.delete(_parentChannelId);
@@ -2774,12 +2863,16 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
 
   const _mentionAc = new AbortController();
   mentionSessions.set(_parentChannelId, _mentionAc);
+  // Per-channel model override — wins over global textModel
+  const { getChannelModel: _getMentionModel } = await import('./channel-models.js');
+  const _mentionModel = _getMentionModel(message.channelId) || _getMentionModel(message.channel?.parentId) || undefined;
   try {
     const result = await generateTextResponse(finalPrompt, {
       channelId: _parentChannelId,
       sessionUser: _sessionUser,
       discordChatHistory,
       skipChannelContext: true,
+      model: _mentionModel,
     });
 
     mentionSessions.delete(_parentChannelId);
@@ -4763,6 +4856,46 @@ async function handleSpeech(userId, audioBuffer, preTranscribed = null) {
     }
 
     // ── Kanban dispatch - Kanban-enabled channel handled CLI command ─
+    // ── Voice schedule create — recurring schedule from spoken command ──
+    if (dispatchResult.type === 'schedule_create') {
+      markBotResponse(userId);
+      try {
+        const _postCh = focusChannelId || TEXT_CHANNEL_ID || VOICE_REPORT_CHANNEL_ID;
+        const { mode: _schedMode, shellCmd: _shellCmd, promptContext: _promptContext } = _inferScheduleMode(dispatchResult.prompt);
+        const sched = createSchedule({
+          prompt: dispatchResult.prompt,
+          promptContext: _promptContext || null,
+          intervalMs: dispatchResult.intervalMs,
+          channelId: _postCh,
+          threadId: null,
+          userId: dispatchResult.userId || userId,
+          terminationPhrase: dispatchResult.terminationPhrase,
+          maxRuns: dispatchResult.maxRuns,
+          mode: _schedMode,
+          model: dispatchResult.model || 'haiku',
+          shellCmd: _shellCmd,
+        });
+        const _secs = Math.round(dispatchResult.intervalMs / 1000);
+        const _human = _secs >= 3600 ? `${Math.round(_secs / 3600)} hours`
+          : _secs >= 60 ? `${Math.round(_secs / 60)} minutes` : `${_secs} seconds`;
+        const _runsNote = dispatchResult.maxRuns > 0 ? `, ${dispatchResult.maxRuns} times` : '';
+        const ack = await synthesizeSpeech(`Scheduled. I'll run that every ${_human}${_runsNote}.`);
+        if (ack) { await playAudioEnhanced(ack); try { unlinkSync(ack); } catch {} }
+        if (_postCh) {
+          fetch(`https://discord.com/api/v10/channels/${_postCh}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${process.env.DISCORD_TOKEN || ''}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: `✅ Scheduled — every ${_human}. ID: \`${sched.id}\`` }),
+          }).catch(() => {});
+        }
+      } catch (err) {
+        logger.error(`[schedule_create voice] failed: ${err.message}`);
+        const errAck = await synthesizeSpeech('Could not set up that schedule.');
+        if (errAck) { await playAudioEnhanced(errAck); try { unlinkSync(errAck); } catch {} }
+      }
+      return;
+    }
+
     if (dispatchResult.type === 'kanban') {
       markBotResponse(userId);
       if (!dispatchResult.silent && dispatchResult.speech) {
@@ -5048,7 +5181,10 @@ async function processBrainTask(taskId, userId, transcript, history, signal, bra
       }
 
       busEmit('BRAIN', `route=task-agent intent=${intentType} task=#${taskId}`, { userId, taskId });
-      const taskResult = await runTaskAgent(transcript, { ...brainOptions, taskId, userId });
+      // Pass history through — the task-agent gateway path spawns a fresh Claude
+      // session per task (no --resume), so without this the agent has zero memory
+      // of prior voice turns. buildTaskAgentPrompt renders this as a recent-turns block.
+      const taskResult = await runTaskAgent(transcript, { ...brainOptions, taskId, userId, history });
 
       if (taskResult.dispatched) {
         markWorking(taskId);

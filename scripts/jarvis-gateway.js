@@ -1,7 +1,10 @@
+import "../src/config-env-bootstrap.js";
 import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { WebSocketServer } from "ws";
+import { parseChannelKey } from "../src/comms/recipient.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -14,12 +17,17 @@ const GATEWAY_TOKEN = process.env.JARVIS_GATEWAY_TOKEN || "";
 const CLAUDE_BIN = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/claude`;
 // Logical model aliases — map short names to Anthropic model IDs.
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+const LMS_MODEL = process.env.JARVIS_LMS_MODEL || "qwen/qwen3.6-35b-a3b";
 const MODEL_ALIASES = {
-  claude:      process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  sonnet:      process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  opus:        process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
-  haiku:       "claude-haiku-4-5-20251001",
-  "opus-plan": process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  claude:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
+  sonnet:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
+  opus:            process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  haiku:           "claude-haiku-4-5-20251001",
+  "opus-plan":     process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  // qwen aliases resolve to the LM Studio model ID (engineEnvForModel sets the base URL)
+  "qwen":          LMS_MODEL,
+  "qwen-focused":  LMS_MODEL,
+  "qwen-fast":     LMS_MODEL,
 };
 // Strip a trailing -<effort> suffix to get the base alias, then add effort suffixes.
 EFFORT_LEVELS.forEach(l => {
@@ -48,6 +56,28 @@ function resolveModel(raw) {
   return "";
 }
 const DEFAULT_CLAUDE_MODEL = resolveModel(process.env.DISPATCH_MODEL) || "claude-sonnet-4-6";
+
+// Qwen alias → LM Studio env overlay.
+// Temperature tiers:
+//   qwen            → 1.0 general/conversational (Jarvis default)
+//   qwen-focused    → 0.6 coding/precise (anti-loop sampling)
+//   qwen-fast       → 0.7 no-think fast responses
+// Temperature is stored in engineEnv.temperature for logging/future proxy use.
+// LM Studio currently uses its per-model default config for actual temp;
+// the alias documents intent and will drive a lightweight proxy when added.
+const QWEN_ALIASES = {
+  'qwen':         { temperature: 1.0, label: 'general' },
+  'qwen-focused': { temperature: 0.6, label: 'focused' },
+  'qwen-fast':    { temperature: 0.7, label: 'fast' },
+};
+function engineEnvForModel(alias) {
+  if (!alias || !QWEN_ALIASES[alias]) return null;
+  const lmsBase = process.env.JARVIS_LMS_BASE_URL;
+  if (!lmsBase) return null;
+  const lmsModel = process.env.JARVIS_LMS_MODEL || 'qwen/qwen3.6-35b-a3b';
+  const { temperature, label } = QWEN_ALIASES[alias];
+  return { ANTHROPIC_BASE_URL: lmsBase, ANTHROPIC_AUTH_TOKEN: 'lmstudio', model: lmsModel, temperature, label };
+}
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || "";
 const DEFAULT_REPORT_CHANNEL = process.env.DISCORD_REPORT_CHANNEL_ID || process.env.DISCORD_TEXT_CHANNEL_ID || "";
 const ALERT_WEBHOOK_TOKEN = process.env.ALERT_WEBHOOK_TOKEN || "";
@@ -61,7 +91,24 @@ const SESSION_STORE_PATH = process.env.SESSION_STORE_PATH || `${_defaultSessionD
 const CHANNEL_ACCOUNTS_PATH = process.env.CHANNEL_ACCOUNTS_PATH || `${_defaultSessionDir}/channel-accounts.json`;
 // Ensure the state directory exists (harmless if already present)
 try { fs.mkdirSync(_defaultSessionDir, { recursive: true }); } catch {}
-const CURSOR_AGENT_TIMEOUT_MS = 600_000; // 10 min — matches GATEWAY_TIMEOUT_MS in jarvis-voice
+const CURSOR_AGENT_TIMEOUT_MS = parseInt(process.env.GATEWAY_CLAUDE_TIMEOUT_MS || '600000');  // default 10 min
+const CURSOR_AGENT_TIMEOUT_LMS_MS = parseInt(process.env.GATEWAY_LMS_TIMEOUT_MS || '1800000'); // default 30 min for local models
+// Idle watchdog: kill the child if no stdout token arrives within this window.
+// Catches qwen stuck in PROCESSINGPROMPT and any model that accepts the request but never streams.
+// Lower than CURSOR_AGENT_TIMEOUT_MS so we fail fast rather than waiting the full timeout.
+const IDLE_WATCHDOG_MS = parseInt(process.env.GATEWAY_IDLE_WATCHDOG_MS || '90000'); // default 90s
+// Stateless channels never use --resume. Every turn sends full collapsed history inline.
+// Context is preserved via brain.js foldHistory; no remote session reload overhead.
+const STATELESS_CHANNEL_IDS = new Set(
+  (process.env.JARVIS_STATELESS_CHANNELS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+function isStatelessChannel(channelKey) {
+  if (!channelKey) return false;
+  for (const id of STATELESS_CHANNEL_IDS) {
+    if (channelKey.includes(id)) return true;
+  }
+  return false;
+}
 
 // ── Per-channel account profiles ─────────────────────────────────────────────
 // Maps channels to separate CLAUDE_CONFIG_DIR paths for multi-account routing.
@@ -77,10 +124,11 @@ let channelAccounts = loadChannelAccounts();
 
 function resolveProfile(channelKey) {
   if (!channelKey) return channelAccounts.profiles?.default ?? null;
-  // Try exact match first; then strip thread suffix so thread sessions inherit channel profile.
+  // Try exact match first; then strip thread/topic suffix so thread sessions
+  // (Discord :thread:) and Telegram :topic: sessions inherit their parent profile.
   let profileName = channelAccounts.channels?.[channelKey];
   if (!profileName) {
-    const parentKey = channelKey.replace(/:thread:\d+$/, "");
+    const parentKey = channelKey.replace(/:(thread|topic):\d+$/, "");
     if (parentKey !== channelKey) profileName = channelAccounts.channels?.[parentKey];
   }
   profileName = profileName || "default";
@@ -151,6 +199,20 @@ function saveCreatedAt() {
   try { fs.writeFileSync(SESSION_STORE_PATH + ".created", JSON.stringify(Object.fromEntries(channelCreatedAt))); }
   catch (e) { log("created_save_warn", { error: e.message }); }
 }
+// Per-channel engine label ("claude" | "qwen") the active session was created with.
+// Used to force a fresh session when the channel's model is switched across engines:
+// a `claude -p --resume <chatId>` reuses the ORIGINAL session's engine regardless of
+// the model flag, so switching a channel from qwen to sonnet (or back) must rotate the
+// session instead of resuming — otherwise the old engine sticks and ignores the change.
+const channelEngine = new Map(Object.entries(loadJsonFile(SESSION_STORE_PATH + ".engine")));
+function saveEngine() {
+  try { fs.writeFileSync(SESSION_STORE_PATH + ".engine", JSON.stringify(Object.fromEntries(channelEngine))); }
+  catch (e) { log("engine_save_warn", { error: e.message }); }
+}
+// Engine label for a requested model alias: "qwen" for any LM Studio alias, else "claude".
+function engineForModel(alias) {
+  return engineEnvForModel(alias) ? "qwen" : "claude";
+}
 
 // Prune sessions older than 30 days at startup to keep the store bounded.
 {
@@ -213,9 +275,10 @@ function _channelIsInAskMode(channelKey) {
   let state;
   try { state = JSON.parse(fs.readFileSync(ASK_MODE_FILE, "utf8")); } catch { return false; }
   // channelKey format: "agent:main:discord:channel:<id>[:thread:<tid>]"
-  const m = channelKey.match(/discord:channel:(\d+)(?::thread:(\d+))?/);
-  if (!m) return false;
-  const [, channelId, threadId] = m;
+  //                 or "agent:main:telegram:chat:<id>[:topic:<tid>]"
+  const parsed = parseChannelKey(channelKey);
+  if (!parsed) return false;
+  const { channelId, threadId } = parsed;
   // Thread-scoped first, then channel-scoped
   if (threadId && state[threadId] === true) return true;
   if (channelId && state[channelId] === true) return true;
@@ -236,9 +299,9 @@ function _channelMcpMode(channelKey) {
   if (channelKey.startsWith("task-agent:")) return { mode: "full" };
   let state;
   try { state = JSON.parse(fs.readFileSync(MCP_MODE_FILE, "utf8")); } catch { return { mode: "off" }; }
-  const m = channelKey.match(/discord:channel:(\d+)(?::thread:(\d+))?/);
-  if (!m) return { mode: "off" };
-  const [, channelId, threadId] = m;
+  const parsed = parseChannelKey(channelKey);
+  if (!parsed) return { mode: "off" };
+  const { channelId, threadId } = parsed;
   const raw = (threadId && state[threadId] !== undefined) ? state[threadId]
             : (channelId && state[channelId] !== undefined) ? state[channelId]
             : null;
@@ -293,7 +356,7 @@ function collapseMessages(messages = []) {
 
 // Spawn claude -p with stream-json output; optionally resume a prior session.
 // Prompt is written to stdin to avoid ARG_MAX limits on large conversation histories.
-function spawnClaudeStream(prompt, model, chatId, channelKey, effort) {
+function spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv = null) {
   const askMode = _channelIsInAskMode(channelKey);
   const base = askMode ? ASK_MODE_ARGS : BASE_ARGS;
 
@@ -341,12 +404,20 @@ function spawnClaudeStream(prompt, model, chatId, channelKey, effort) {
   } else {
     delete cleanEnv.ANTHROPIC_BASE_URL;
   }
+  // Per-request engine overlay (Telegram /engine qwen): point the SAME claude -p
+  // subprocess at LM Studio. Wins over ClaudeFlare for this spawn. null/{} for claude.
+  if (engineEnv && engineEnv.ANTHROPIC_BASE_URL) {
+    cleanEnv.ANTHROPIC_BASE_URL = engineEnv.ANTHROPIC_BASE_URL;
+    if (engineEnv.ANTHROPIC_AUTH_TOKEN) cleanEnv.ANTHROPIC_AUTH_TOKEN = engineEnv.ANTHROPIC_AUTH_TOKEN;
+    log("engine_overlay_spawn", { channelKey, baseUrl: engineEnv.ANTHROPIC_BASE_URL });
+  }
   const profile = resolveProfile(channelKey);
   if (profile?.configDir) cleanEnv.CLAUDE_CONFIG_DIR = profile.configDir;
-  log("claude_spawn", { model, chatId: chatId || null, channelKey, profile: profile?.label || "default", configDir: profile?.configDir || null });
+  const spawnTimeoutMs = (engineEnv?.ANTHROPIC_BASE_URL) ? CURSOR_AGENT_TIMEOUT_LMS_MS : CURSOR_AGENT_TIMEOUT_MS;
+  log("claude_spawn", { model, chatId: chatId || null, channelKey, profile: profile?.label || "default", configDir: profile?.configDir || null, timeoutMs: spawnTimeoutMs });
   const child = spawn(CLAUDE_BIN, args, {
     env: cleanEnv,
-    timeout: CURSOR_AGENT_TIMEOUT_MS,
+    timeout: spawnTimeoutMs,
     stdio: ["pipe", "pipe", "pipe"],
   });
   // Track the child BEFORE touching stdin so a throw on `.end()` (non-string prompt,
@@ -363,6 +434,23 @@ function spawnClaudeStream(prompt, model, chatId, channelKey, effort) {
   return child;
 }
 
+// Map any channelKey to the stable haivemind memory category for that surface.
+// Thread/topic suffixes are stripped so a thread/topic shares its parent's
+// memory (same inheritance the profile/ask-mode/mcp lookups already use).
+//   discord:  agent:main:discord:channel:<id>[:thread:<tid>]  -> channel:<id>
+//   telegram: agent:main:telegram:chat:<id>[:topic:<tid>]     -> channel:telegram:chat:<id>
+// Returns null for an unrecognized key (memory then skipped, not misfiled).
+// IMPORTANT: this must agree with the read side (getChannelContext, which
+// prepends "channel:" to the channelId it is handed) — see brain.js.
+function memoryCategory(channelKey) {
+  const k = String(channelKey || "");
+  const d = k.match(/discord:channel:(\d+)/);
+  if (d) return `channel:${d[1]}`;
+  const t = k.match(/telegram:chat:([\w-]+)/);
+  if (t) return `channel:telegram:chat:${t[1]}`;
+  return null;
+}
+
 // Summarize the old chatId to haivemind before rotation so context survives.
 // Fire-and-forget — does not block the rotation; new chat starts fresh immediately.
 async function summarizeAndStoreChat(channelKey, oldChatId) {
@@ -370,19 +458,20 @@ async function summarizeAndStoreChat(channelKey, oldChatId) {
   try {
     const result = await callClaudeAgent(SUMMARY_PROMPT, DEFAULT_CLAUDE_MODEL, oldChatId);
     if (!result.text) return;
-    // Store to haivemind under channel namespace — getChannelContext() will pick this up next turn
-    const channelId = (channelKey.match(/channel:(\d+)/) || [])[1];
-    if (channelId && DISCORD_TOKEN) {
-      // Use the MCP JSON-RPC envelope via storeMemory(). The prior code POSTed to
-      // a bare /store_memory path that haivemind doesn't serve — every session
-      // summary was silently dropped, and chat_summary_stored logs were misleading.
+    // Store under the per-surface namespace — getChannelContext() reads it next turn.
+    // (Previously this only matched discord:channel:<id> AND required DISCORD_TOKEN,
+    // so Telegram session summaries were silently dropped — Telegram had no memory.)
+    const category = memoryCategory(channelKey);
+    if (category) {
+      // Use the MCP JSON-RPC envelope via storeMemory(). A prior bug POSTed to a
+      // bare /store_memory path haivemind doesn't serve, silently dropping summaries.
       try {
-        await storeMemory(`[SESSION SUMMARY] ${result.text}`, `channel:${channelId}`);
+        await storeMemory(`[SESSION SUMMARY] ${result.text}`, category);
       } catch (err) {
-        log("chat_summary_store_failed", { channelKey, channelId, error: err.message });
+        log("chat_summary_store_failed", { channelKey, category, error: err.message });
       }
     }
-    log("chat_summary_stored", { channelKey, channelId, chars: result.text.length });
+    log("chat_summary_stored", { channelKey, category, chars: result.text.length });
   } catch (e) {
     log("chat_summary_failed", { channelKey, error: e.message });
   }
@@ -391,20 +480,29 @@ async function summarizeAndStoreChat(channelKey, oldChatId) {
 // Return an existing chatId for the channel, or create a new one.
 // Uses a per-channel Promise lock to prevent duplicate create-chat on concurrent requests.
 // Rotates automatically if turn count or age limits are exceeded.
-async function getOrCreateChatId(channelKey) {
+async function getOrCreateChatId(channelKey, requestedEngine = null) {
   if (channelKey && channelSessions.has(channelKey)) {
     const turns = channelTurns.get(channelKey) || 0;
     const age = Date.now() - (channelCreatedAt.get(channelKey) || 0);
-    if (turns >= CURSOR_MAX_TURNS_PER_CHAT || age > CURSOR_MAX_AGE_MS) {
+    // Engine switch (e.g. qwen → sonnet): a resumed session keeps its original engine,
+    // so a model change across engines must rotate rather than --resume the stale one.
+    const sessionEngine = channelEngine.get(channelKey) || null;
+    const engineChanged = requestedEngine != null && sessionEngine != null && sessionEngine !== requestedEngine;
+    if (turns >= CURSOR_MAX_TURNS_PER_CHAT || age > CURSOR_MAX_AGE_MS || engineChanged) {
       const oldChatId = channelSessions.get(channelKey);
-      log("chat_rotation", { channelKey, turns, ageMs: age, reason: turns >= CURSOR_MAX_TURNS_PER_CHAT ? "turns" : "age" });
-      // Summarize old session to haivemind (fire-and-forget, does not block rotation)
-      summarizeAndStoreChat(channelKey, oldChatId).catch(() => {});
+      const reason = engineChanged ? "engine_change"
+        : (turns >= CURSOR_MAX_TURNS_PER_CHAT ? "turns" : "age");
+      log("chat_rotation", { channelKey, turns, ageMs: age, reason, fromEngine: sessionEngine, toEngine: requestedEngine });
+      // Summarize old session to haivemind (fire-and-forget, does not block rotation).
+      // Skip on engine change: the old session may be the wedged one we're escaping,
+      // and resuming it to summarize would re-trigger the same hang.
+      if (!engineChanged) summarizeAndStoreChat(channelKey, oldChatId).catch(() => {});
       metrics.sessionsRotated++;
       channelSessions.delete(channelKey);
       channelTurns.delete(channelKey);
       channelCreatedAt.delete(channelKey);
-      saveSessions(); saveTurns(); saveCreatedAt();
+      channelEngine.delete(channelKey);
+      saveSessions(); saveTurns(); saveCreatedAt(); saveEngine();
     } else {
       metrics.sessionsResumed++;
       return channelSessions.get(channelKey);
@@ -416,13 +514,16 @@ async function getOrCreateChatId(channelKey) {
   return null;
 }
 
-function setSession(channelKey, sessionId) {
+function setSession(channelKey, sessionId, engine = null) {
   if (!channelKey || !sessionId) return;
   const prev = channelSessions.get(channelKey);
   const isNew = !channelSessions.has(channelKey);
   const isRotation = !isNew && prev && prev !== sessionId;
   channelSessions.set(channelKey, sessionId);
   channelTurns.set(channelKey, (channelTurns.get(channelKey) || 0) + 1);
+  // Record the engine this session was created/resumed under, so a later model
+  // switch across engines triggers rotation in getOrCreateChatId.
+  if (engine != null) { channelEngine.set(channelKey, engine); saveEngine(); }
   if (isNew) { channelCreatedAt.set(channelKey, Date.now()); saveCreatedAt(); }
   saveSessions(); saveTurns();
 
@@ -487,17 +588,31 @@ setInterval(() => {
 
 // Buffer the full response from claude -p (non-streaming path).
 // Parses NDJSON lines; extracts text from result event and session_id from system:init.
-async function callClaudeAgent(prompt, modelOverride, chatId, channelKey) {
+async function callClaudeAgent(prompt, modelOverride, chatId, channelKey, engineEnv = null) {
   const effort = effortForAlias(modelOverride);
   const model = resolveModel(modelOverride) || DEFAULT_CLAUDE_MODEL;
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort);
+    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv);
     let buf = "";
     let stderr = "";
+    let idleTimer = setTimeout(() => {
+      log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS, path: "non-streaming" });
+      try { child.kill("SIGKILL"); } catch {}
+    }, IDLE_WATCHDOG_MS);
+    idleTimer.unref();
     child.stderr.on("data", (d) => { stderr += d; });
-    child.stdout.on("data", (d) => { buf += d; });
+    child.stdout.on("data", (d) => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS, path: "non-streaming" });
+        try { child.kill("SIGKILL"); } catch {}
+      }, IDLE_WATCHDOG_MS);
+      idleTimer.unref();
+      buf += d;
+    });
     child.on("close", (code) => {
+      clearTimeout(idleTimer);
       const durationMs = Date.now() - start;
       let resultText = "";
       let sessionId = chatId || null;
@@ -524,7 +639,7 @@ async function callClaudeAgent(prompt, modelOverride, chatId, channelKey) {
       log("claude_agent_done", { code, durationMs, model, chars: resultText.length });
       resolve({ text: resultText, model: `claude/${model}`, sessionId });
     });
-    child.on("error", (err) => { metrics.errors++; reject(err); });
+    child.on("error", (err) => { clearTimeout(idleTimer); metrics.errors++; reject(err); });
   });
 }
 
@@ -575,19 +690,33 @@ function _toolResultPreview(toolName, raw) {
 
 // Stream claude -p NDJSON deltas directly to an SSE response.
 // Returns the resolvedSessionId once the stream completes.
-async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort) {
+async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, engineEnv = null) {
   const completionId = `chatcmpl-${crypto.randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   const start = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort);
+    const child = spawnClaudeStream(prompt, model, chatId, channelKey, effort, engineEnv);
     let lineBuf = "";
     let resolvedSessionId = chatId;
     let clientAborted = false;
     let lastTextLen = 0;  // tracks how many chars we've already forwarded as deltas
     const _seenToolIds = new Set();       // dedupe tool_use progress lines per request
     const _toolIdToName = new Map();      // tool_use_id → name, for result attribution
+
+    // Idle watchdog — kill child if no stdout arrives within IDLE_WATCHDOG_MS.
+    // Resets on every data chunk so a model actively streaming is never killed.
+    let idleTimer = null;
+    const resetIdleWatchdog = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (clientAborted) return;
+        log("idle_watchdog_kill", { model, channelKey, idleMs: IDLE_WATCHDOG_MS });
+        try { child.kill("SIGKILL"); } catch {}
+      }, IDLE_WATCHDOG_MS);
+      idleTimer.unref();
+    };
+    resetIdleWatchdog();
 
     // Client-disconnect handler — kill the cursor-agent child when the HTTP
     // client aborts the stream. Without this, aborted requests orphan the
@@ -677,6 +806,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
     }
 
     child.stdout.on("data", (chunk) => {
+      resetIdleWatchdog();
       lineBuf += chunk.toString();
       const lines = lineBuf.split("\n");
       lineBuf = lines.pop(); // hold incomplete last line
@@ -684,6 +814,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
     });
     child.stderr.on("data", () => {});
     child.on("close", (code) => {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       res.removeListener("close", onClose);
       if (clientAborted) return; // already rejected with "client disconnected"
       if (lineBuf.trim()) handleLine(lineBuf);
@@ -701,6 +832,7 @@ async function streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, ef
       resolve(resolvedSessionId);
     });
     child.on("error", (err) => {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
       res.removeListener("close", onClose);
       metrics.errors++;
       reject(err);
@@ -904,17 +1036,18 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
       if (lockResolve) { lockResolve(); channelSessionLocks.delete(channelKey); lockResolve = null; }
     };
 
-    const chatId = await getOrCreateChatId(channelKey);
+    const requestedEngine = engineForModel(requestedModel);
+    // Stateless channels skip --resume entirely: full history arrives inline from brain.js
+    // foldHistory on every turn, so context is preserved without remote session reload overhead.
+    const stateless = isStatelessChannel(channelKey);
+    const chatId = stateless ? null : await getOrCreateChatId(channelKey, requestedEngine);
 
-    // If we got a resumed chatId, release the lock immediately — no spawn-serialization
-    // is needed for resumes (claude already has history, no double-session risk).
-    if (chatId) {
-      releaseLock();
-    }
+    // Lock is held through the full Claude spawn for both new and resumed sessions.
+    // Resuming the same chatId concurrently causes multiple claude --resume processes
+    // to compete on the same session, each taking 8+ min and piling up indefinitely.
 
-    // On a resumed session: re-inject the system prompt on every turn so Jarvis instructions
-    // survive compaction. Claude already has full conversation history via --resume.
-    // On a new session: send the full collapsed context (system + history + user message).
+    // Stateless / new session: send full collapsed context (system + history + user message).
+    // Resumed session: re-inject system prompt so Jarvis instructions survive compaction.
     const _sysMsg = (req.body?.messages || []).find(m => m?.role === "system");
     const _sysText = _sysMsg ? contentToText(_sysMsg.content) : "";
     const prompt = chatId
@@ -929,7 +1062,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
 
       let resolvedSessionId;
       try {
-        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort);
+        resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
       } catch (streamError) {
         releaseLock();
         // Don't try to write to a closed/aborted socket.
@@ -941,7 +1074,7 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
         return;
       }
 
-      setSession(channelKey, resolvedSessionId);
+      setSession(channelKey, resolvedSessionId, requestedEngine);
       releaseLock();
 
       res.write(`data: ${JSON.stringify({
@@ -957,8 +1090,8 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
     }
 
     // Non-streaming path
-    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey);
-    setSession(channelKey, result.sessionId);
+    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
+    setSession(channelKey, result.sessionId, requestedEngine);
     releaseLock();
     res.json(openAiCompletionResponse(requestedModel, result.text));
   } catch (error) {
@@ -983,9 +1116,10 @@ app.post("/hooks/agent", requireAuth, async (req, res) => {
   queueMicrotask(async () => {
     let result;
     try {
-      const chatId = await getOrCreateChatId(channelKey);
-      result = await callClaudeAgent(message, requestedModel, chatId, channelKey);
-      if (channelKey && result?.sessionId) setSession(channelKey, result.sessionId);
+      const hookEngine = engineForModel(requestedModel);
+      const chatId = await getOrCreateChatId(channelKey, hookEngine);
+      result = await callClaudeAgent(message, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
+      if (channelKey && result?.sessionId) setSession(channelKey, result.sessionId, hookEngine);
     } catch (error) {
       const failure = `Task ${taskId || ""} failed: ${error.message || error}`.trim();
       log("hooks_agent_error", { taskId, channelId, error: String(error.message || error) });
@@ -1049,8 +1183,274 @@ app.post("/v1/task/run", requireAuth, async (req, res) => {
   });
 });
 
+// ── Blade TTS audio file route ────────────────────────────────────────────────
+// Serves generated WAV files written by the Blade WS handler.
+// Files are cleaned up automatically 60 s after creation.
+const BLADE_TTS_DIR = "/tmp";
+app.get("/v1/blade/tts/:id", requireAuth, (req, res) => {
+  const id = String(req.params.id || "").replace(/[^a-zA-Z0-9-]/g, "");
+  const filePath = `${BLADE_TTS_DIR}/blade-tts-${id}.wav`;
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "TTS file not found or expired" });
+  }
+  res.setHeader("Content-Type", "audio/wav");
+  fs.createReadStream(filePath).pipe(res);
+});
+
 app.use((_req, res) => {
   res.status(405).json({ error: "Unsupported route" });
+});
+
+// ── Vuzix Blade 2 WebSocket relay ─────────────────────────────────────────────
+// Path: ws://host:22100/v1/blade
+// Auth: Bearer token (JARVIS_GATEWAY_TOKEN), same as HTTP routes.
+// Frames are JSON objects in both directions.
+//
+// Inbound frame types (Blade → gateway):
+//   { type: "prompt",      text: string }   — run a new Claude turn
+//   { type: "stop" }                        — abort the active claude process
+//   { type: "new-session" }                 — rotate to a fresh Claude session
+//   { type: "approve" }                     — confirm a pending approval prompt
+//   { type: "deny" }                        — reject a pending approval prompt
+//
+// Outbound frame types (gateway → Blade):
+//   { type: "token",    text: string }      — streaming partial text delta
+//   { type: "done",     fullText: string }  — stream finished; fullText = everything
+//   { type: "approval", prompt: string }    — paused, awaiting approve/deny
+//   { type: "error",    message: string }   — something went wrong
+//   { type: "tts",      url: string }       — TTS audio available at this GET URL
+
+// ANSI escape code stripper (blade display has no ANSI rendering)
+const ANSI_RE = /[][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><~]/g;
+function stripAnsiForBlade(str) {
+  return String(str || "").replace(ANSI_RE, "");
+}
+
+// Approval-prompt detector — patterns that claude uses when it needs confirmation
+const APPROVAL_RE = /\[Y\/n\]|Approve\?|allow|deny|yes\/no|\(y\/N\)/i;
+
+const bladeWss = new WebSocketServer({ noServer: true });
+
+bladeWss.on("connection", (ws, req) => {
+  // ── Auth ─────────────────────────────────────────────────────────────────
+  if (GATEWAY_TOKEN) {
+    const auth = req.headers.authorization || "";
+    if (auth !== `Bearer ${GATEWAY_TOKEN}`) {
+      ws.close(4001, "Unauthorized");
+      return;
+    }
+  }
+
+  // ── Per-connection state ─────────────────────────────────────────────────
+  const channelKey = `agent:main:blade:session:${crypto.randomUUID()}`;
+  let chatId = null;        // resolved after first getOrCreateChatId
+  let activeChild = null;   // current claude subprocess (if streaming)
+  let approved = null;      // null=not waiting, true=approved, false=denied
+  let approvalResolve = null; // resolve fn for the in-flight approval promise
+
+  // Warm the session immediately on connect
+  getOrCreateChatId(channelKey).then(id => { chatId = id; }).catch(() => {});
+
+  log("blade_connected", { channelKey });
+
+  function send(frame) {
+    if (ws.readyState === ws.OPEN) {
+      try { ws.send(JSON.stringify(frame)); } catch (e) {
+        log("blade_send_error", { channelKey, error: e.message });
+      }
+    }
+  }
+
+  // ── Inbound message handler ──────────────────────────────────────────────
+  ws.on("message", async (raw) => {
+    let frame;
+    try { frame = JSON.parse(String(raw)); } catch {
+      send({ type: "error", message: "invalid JSON frame" });
+      return;
+    }
+
+    // ── approve / deny — resolve in-flight approval gate ──────────────────
+    if (frame.type === "approve" || frame.type === "deny") {
+      approved = frame.type === "approve";
+      if (approvalResolve) { approvalResolve(approved); approvalResolve = null; }
+      return;
+    }
+
+    // ── stop — kill active process ────────────────────────────────────────
+    if (frame.type === "stop") {
+      if (activeChild) {
+        try { activeChild.kill("SIGTERM"); } catch {}
+        setTimeout(() => { try { activeChild?.kill("SIGKILL"); } catch {} }, 2_000).unref();
+        activeChild = null;
+      }
+      return;
+    }
+
+    // ── new-session — rotate Claude session ───────────────────────────────
+    if (frame.type === "new-session") {
+      if (activeChild) {
+        try { activeChild.kill("SIGTERM"); } catch {}
+        activeChild = null;
+      }
+      channelSessions.delete(channelKey);
+      channelTurns.delete(channelKey);
+      channelCreatedAt.delete(channelKey);
+      saveSessions(); saveTurns(); saveCreatedAt();
+      chatId = null;
+      await getOrCreateChatId(channelKey).then(id => { chatId = id; }).catch(() => {});
+      send({ type: "token", text: "[session rotated]\n" });
+      return;
+    }
+
+    // ── prompt — run a claude turn ────────────────────────────────────────
+    if (frame.type === "prompt") {
+      const promptText = String(frame.text || "").trim();
+      if (!promptText) { send({ type: "error", message: "empty prompt" }); return; }
+      if (activeChild) { send({ type: "error", message: "busy — send stop first" }); return; }
+
+      // Resolve chatId if not yet warmed
+      if (chatId === null) {
+        try { chatId = await getOrCreateChatId(channelKey); } catch (e) {
+          send({ type: "error", message: `session error: ${e.message}` });
+          return;
+        }
+      }
+
+      const model = DEFAULT_CLAUDE_MODEL;
+      let child;
+      try {
+        child = spawnClaudeStream(promptText, model, chatId, channelKey, null);
+      } catch (e) {
+        send({ type: "error", message: `spawn failed: ${e.message}` });
+        return;
+      }
+      activeChild = child;
+
+      let lineBuf = "";
+      let fullText = "";
+      let resolvedSessionId = chatId;
+      let lastTextLen = 0;
+      approved = null;
+      approvalResolve = null;
+
+      child.stdout.on("data", async (chunk) => {
+        lineBuf += chunk.toString();
+        const lines = lineBuf.split("\n");
+        lineBuf = lines.pop(); // hold incomplete last line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let ev;
+          try { ev = JSON.parse(line); } catch { continue; }
+
+          if (ev.session_id) resolvedSessionId = ev.session_id;
+
+          if (ev.type === "assistant") {
+            const textBlock = (ev.message?.content ?? []).find(b => b.type === "text");
+            const text = textBlock?.text ?? "";
+            if (text.length > lastTextLen) {
+              const delta = stripAnsiForBlade(text.slice(lastTextLen));
+              lastTextLen = text.length;
+              fullText += delta;
+              send({ type: "token", text: delta });
+
+              // Scan for approval patterns in the new delta
+              if (APPROVAL_RE.test(delta)) {
+                const lines = delta.split("\n").filter(Boolean);
+                const lastLine = lines[lines.length - 1] || delta.trim();
+                send({ type: "approval", prompt: lastLine });
+                // Pause: wait for approve/deny frame (or WS close)
+                const userApproval = await new Promise((resolve) => {
+                  approvalResolve = resolve;
+                  // Auto-deny if WS closes while waiting
+                  ws.once("close", () => resolve(false));
+                });
+                if (!userApproval) {
+                  // User denied — kill the claude process
+                  try { child.kill("SIGTERM"); } catch {}
+                  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2_000).unref();
+                }
+              }
+            }
+          }
+
+          if (ev.type === "result" && ev.is_error) {
+            send({ type: "error", message: ev.result || "claude stream error" });
+            try { child.kill("SIGTERM"); } catch {}
+          }
+        }
+      });
+
+      child.stderr.on("data", () => {}); // swallow stderr
+
+      child.on("close", async (code) => {
+        activeChild = null;
+        if (lineBuf.trim()) {
+          // Flush any partial line
+          let ev;
+          try { ev = JSON.parse(lineBuf); } catch { ev = null; }
+          if (ev?.session_id) resolvedSessionId = ev.session_id;
+        }
+
+        // Persist session
+        if (resolvedSessionId) setSession(channelKey, resolvedSessionId);
+        chatId = resolvedSessionId;
+
+        const summary = fullText.trim() ? summarize(fullText) : "";
+        send({ type: "done", fullText });
+
+        // TTS — write summary to a temp WAV file via postSpeakSummary (fire-and-forget)
+        // postSpeakSummary only POSTs to piper-server (speaks on local speakers);
+        // we also expose the audio if piper-server returns a file path.
+        // Since postSpeakSummary doesn't return a file path, we generate a unique ID
+        // for the TTS URL and serve it if the piper-server wrote a file there.
+        if (summary) {
+          const ttsId = crypto.randomUUID();
+          const ttsPath = `${BLADE_TTS_DIR}/blade-tts-${ttsId}.wav`;
+
+          // Best-effort: trigger speak (fire-and-forget, no await blocking WS response)
+          postSpeakSummary(summary, null).catch(() => {});
+
+          // If piper-server also saves to ttsPath (configured externally), expose the URL.
+          // Auto-cleanup after 60 s regardless.
+          const cleanupTimer = setTimeout(() => {
+            fs.unlink(ttsPath, () => {});
+          }, 60_000);
+          cleanupTimer.unref();
+
+          send({ type: "tts", url: `/v1/blade/tts/${ttsId}` });
+        }
+
+        if (code !== 0 && code !== null) {
+          log("blade_claude_exit_error", { channelKey, code });
+        }
+      });
+
+      child.on("error", (err) => {
+        activeChild = null;
+        send({ type: "error", message: `process error: ${err.message}` });
+      });
+
+      return;
+    }
+
+    send({ type: "error", message: `unknown frame type: ${frame.type}` });
+  });
+
+  ws.on("close", () => {
+    log("blade_disconnected", { channelKey });
+    if (activeChild) {
+      try { activeChild.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { activeChild?.kill("SIGKILL"); } catch {} }, 2_000).unref();
+      activeChild = null;
+    }
+    // Resolve any pending approval gate so streaming stops
+    if (approvalResolve) { approvalResolve(false); approvalResolve = null; }
+  });
+
+  ws.on("error", (err) => {
+    log("blade_ws_error", { channelKey, error: err.message });
+  });
 });
 
 // ── Graceful shutdown — drain in-flight cursor-agent children before exiting ──
@@ -1088,7 +1488,7 @@ function validateStartup() {
 }
 validateStartup();
 
-const server = app.listen(PORT, "127.0.0.1", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   const profileStats = validateProfiles();
   log("startup", {
     port: PORT,
@@ -1098,4 +1498,14 @@ const server = app.listen(PORT, "127.0.0.1", () => {
     sessionStore: SESSION_STORE_PATH,
     profiles_loaded: profileStats,
   });
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/v1/blade") {
+    bladeWss.handleUpgrade(req, socket, head, (ws) => {
+      bladeWss.emit("connection", ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
 });

@@ -1,6 +1,12 @@
 import logger from '../logger.js';
 import { VOICE_NAME } from '../voice/wakeword.js';
 import { getActiveSessionUser, touchActivity, maybeRotateSession, storeTaskToHaivemind, getHaivemindContext, consumeNewSessionFlag, consumeRotatedHistory, getChannelContext, storeChannelMemory } from '../agent/session-manager.js';
+
+function _stripPromptPreamble(prompt) {
+  const marker = '[END BACKGROUND CONTEXT — respond only to the user message below]\n\n';
+  const idx = (prompt || '').indexOf(marker);
+  return idx !== -1 ? prompt.slice(idx + marker.length) : (prompt || '');
+}
 /**
  * Brain Module - Thin voice I/O layer to Jarvis Gateway
  * 
@@ -1222,9 +1228,22 @@ export async function generateContextualInterim(userRequest) {
  * Used for @mention handling in Discord text channels.
  * Routes through the same gateway session but with a [TEXT] tag instead of [VOICE].
  */
+// A short surface-specific instruction prepended to the system prompt so the
+// agent shapes its reply for where it will be displayed. Telegram renders a
+// limited HTML subset (no headers/tables), so keep formatting light.
+function _surfaceInstruction(surfaceHint) {
+  if (surfaceHint === 'telegram') {
+    return 'You are replying in a Telegram chat. Keep formatting light: short '
+      + 'paragraphs, simple bullets, and inline `code` or fenced code blocks where '
+      + 'useful. Avoid Markdown headers (#), tables, and deep nesting — Telegram '
+      + 'cannot render them. Be concise and conversational.\n\n';
+  }
+  return '';
+}
+
 export async function generateTextResponse(userMessage, options = {}) {
   const channelId = options.channelId || _defaultTextChannel;
-  const textTag = resolvePrompt('text-channel.txt', {
+  const textTag = _surfaceInstruction(options.surfaceHint) + resolvePrompt('text-channel.txt', {
     VOICE_NAME,
     TEXT_CHANNEL_ID: channelId,
   });
@@ -1261,7 +1280,8 @@ export async function generateTextResponse(userMessage, options = {}) {
         messages,
         max_tokens: 8192,
         user: options.sessionUser || getActiveSessionUser(),
-        model: textModel,
+        model: options.model || textModel,
+        ...(options.engineEnv ? { engineEnv: options.engineEnv } : {}),
         ...THINKING_PARAM,
       }),
     }, undefined, channelId);
@@ -1275,7 +1295,7 @@ export async function generateTextResponse(userMessage, options = {}) {
     const text = data.choices?.[0]?.message?.content || '';
 
     // Store to haivemind after reply — fire and forget, same category as read
-    storeChannelMemory(channelId, userMessage, text).catch(() => {});
+    storeChannelMemory(channelId, _stripPromptPreamble(userMessage), text).catch(() => {});
 
     return { text };
 
@@ -1285,7 +1305,27 @@ export async function generateTextResponse(userMessage, options = {}) {
   }
 }
 
-function buildTaskAgentPrompt(userMessage, options = {}) {
+/**
+ * Render the last N user/assistant turns into a compact transcript block.
+ * The task-agent path spawns a fresh Claude session per turn (no --resume), so
+ * without this prelude every voice utterance behaves like a brand-new conversation
+ * and forgets the prior exchange. Trimmed for size; full state lives in haivemind.
+ */
+function _formatTaskAgentHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) return '';
+  // Drop the trailing user turn — that's the current message, included separately
+  const turns = history.slice(0, -1).filter(m => m && m.role && m.content);
+  if (turns.length === 0) return '';
+  const recent = turns.slice(-6); // last 3 exchanges, enough for follow-up context
+  const lines = recent.map(m => {
+    const role = m.role === 'assistant' ? 'JARVIS' : 'USER';
+    const text = String(m.content).substring(0, 600).replace(/\s+/g, ' ').trim();
+    return `${role}: ${text}`;
+  });
+  return `[RECENT VOICE CONVERSATION — for continuity; treat the user's current message as the active turn]\n${lines.join('\n')}\n\n`;
+}
+
+export function buildTaskAgentPrompt(userMessage, options = {}) {
   const _now = new Date();
   let contextTags = `[DATETIME: ${_now.toLocaleString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}] `;
   if (options.speaker) contextTags += `[SPEAKER: ${options.speaker}] `;
@@ -1295,12 +1335,18 @@ function buildTaskAgentPrompt(userMessage, options = {}) {
   const focusCtx = getFullFocusContext() || getFocusContextTag();
   if (focusCtx) contextTags += focusCtx + ' ';
 
+  // Conversation continuity: task-agent gateway path uses channelKey "task-agent:<id>"
+  // which always spawns a fresh claude -p session (chatId=null, no --resume). Without
+  // injecting recent turns here, every voice ACTION/EMAIL/CALENDAR/etc utterance loses
+  // memory of the prior exchange — Lance's "mid-lost everything" voice symptom.
+  const historyBlock = _formatTaskAgentHistory(options.history);
+
   const taskId = String(options.taskId || '').replace(/'/g, '');
   // Single-quote-safe snippet for shell embedding — apostrophes in speech break mcporter arg parsing
   const safeSnip = userMessage.substring(0, 120).replace(/"/g, '\\"').replace(/'/g, "\\'");
   return `${getVoiceTag()}
 
-${contextTags}${userMessage}
+${historyBlock}${contextTags}${userMessage}
 
 TASK AGENT INSTRUCTIONS:
 - You are a disposable task agent with full tool access. Complete this task fully.
@@ -1370,7 +1416,12 @@ Replace YOUR_TLDR_HERE with a brief spoken summary (escaped for JSON).
 3. ARTIFACT TRACKING (MANDATORY if you created/modified files or committed code):
 Store a record of what was written and where so other sessions can find it:
 mcporter call haivemind.store_memory content="ARTIFACT [timestamp]: files=[list every file path created/modified] | repo=[repo path] | commit=[hash if committed] | branch=[branch] | summary=[what was built]" category="operations"
-Never skip this step. The voice session cannot see your filesystem — this is the only way to track code artifacts across sessions.`;
+Never skip this step. The voice session cannot see your filesystem — this is the only way to track code artifacts across sessions.
+
+MONITORING / LOOPING (do NOT roll your own poller):
+If the user asks you to monitor something, poll/check repeatedly, keep an eye on a long job, or continue when it finishes, do NOT write a detached background script (no "while true; sleep; done" bash, no nohup, no standalone cron job). Those run invisibly, leave orphan processes, and the user cannot see or stop them from Discord.
+Instead, do ONE check now, report the current state, and then say plainly that the user can run a visible, stoppable loop with: the /loop slash command, or by saying "monitor it every N minutes" / "keep checking until it's done" in this channel — both are handled by the app's loop+schedule engine, post each iteration into the thread, and stop with "stop loop" or /stop. Recommend that instead of building your own monitor. If you genuinely cannot use those (e.g. you need sub-second polling), say so explicitly rather than spawning a hidden process.
+If a prompt you receive begins with "[AUTONOMOUS LOOP" you are ALREADY inside that loop engine — do exactly one unit of work and end your reply with the required STATUS line (STATUS: WORKING | STATUS: BLOCKED <reason> | STATUS: DONE). Never start your own poller from inside a loop turn; the engine calls you again. If you're stuck on something only the user can resolve, say STATUS: BLOCKED <reason> — an honest block beats a fake "done".`;
 
   try {
     const res = await fetch(HOOKS_AGENT_URL, {
@@ -1408,7 +1459,7 @@ Never skip this step. The voice session cannot see your filesystem — this is t
 
 export async function generateTextResponseStreaming(userMessage, onChunk, options = {}) {
   const channelId = options.channelId || _defaultTextChannel;
-  const textTag = resolvePrompt("text-channel.txt", {
+  const textTag = _surfaceInstruction(options.surfaceHint) + resolvePrompt("text-channel.txt", {
     VOICE_NAME,
     TEXT_CHANNEL_ID: channelId,
   });
@@ -1447,8 +1498,9 @@ export async function generateTextResponseStreaming(userMessage, onChunk, option
         messages,
         max_tokens: 8192,
         user: options.sessionUser || getActiveSessionUser(),
-        model: textModel,
+        model: options.model || textModel,
         stream: true,
+        ...(options.engineEnv ? { engineEnv: options.engineEnv } : {}),
         ...THINKING_PARAM,
       }),
     }, undefined, channelId);
@@ -1489,7 +1541,7 @@ export async function generateTextResponseStreaming(userMessage, onChunk, option
     }
 
     // Store to haivemind after reply — fire and forget
-    storeChannelMemory(channelId, userMessage, fullText).catch(() => {});
+    storeChannelMemory(channelId, _stripPromptPreamble(userMessage), fullText).catch(() => {});
     return { text: fullText };
 
   } catch (err) {

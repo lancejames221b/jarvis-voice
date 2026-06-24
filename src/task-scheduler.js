@@ -40,7 +40,12 @@ async function tick() {
   const now = Date.now();
   const due = schedules.filter(s => s.enabled && s.nextRunAt <= now);
   for (const sched of due) {
-    sched.nextRunAt = now + sched.intervalMs;
+    // re-arm: daily schedules use next occurrence of dailyAt; interval schedules use now+intervalMs
+    if (sched.dailyAt) {
+      sched.nextRunAt = computeNextDailyRun(sched.dailyAt);
+    } else {
+      sched.nextRunAt = now + sched.intervalMs;
+    }
     sched.lastRunAt = now;
     sched.runCount++;
     saveSchedules();
@@ -59,24 +64,42 @@ async function tick() {
   }
 }
 
+export function computeNextDailyRun(hhmm, fromMs = Date.now()) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const now = new Date(fromMs);
+  const candidate = new Date(now);
+  candidate.setHours(h, m, 0, 0);
+  if (candidate.getTime() > now.getTime()) return candidate.getTime();
+  candidate.setDate(candidate.getDate() + 1);
+  return candidate.getTime();
+}
+
+let _tickInterval = null;
+
 export function initScheduler(dispatchFn) {
   _dispatchFn = dispatchFn;
+  if (_tickInterval) return; // already running — just updated dispatchFn
   const tickMs = parseInt(process.env.SCHEDULER_TICK_MS || '30000');
-  setInterval(tick, tickMs);
+  _tickInterval = setInterval(tick, tickMs);
   logger.info(`[scheduler] started — ${schedules.length} schedule(s) loaded, tick every ${tickMs}ms`);
 }
 
-export function createSchedule({ prompt, intervalMs, channelId, userId, terminationPhrase, maxRuns, mode, model, shellCmd }) {
+export function createSchedule({ prompt, promptContext, intervalMs, channelId, threadId, userId, terminationPhrase, maxRuns, mode, model, shellCmd, dailyAt }) {
   const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const entry = {
     id,
     prompt,
+    promptContext: promptContext || null, // for shell+LLM hybrid: context template prepended to shell stdout
     mode: mode || 'llm',           // 'shell' | 'llm'
     model: model || 'haiku',       // gateway model alias for llm mode
     shellCmd: shellCmd || null,    // shell command string for shell mode
     intervalMs,
-    nextRunAt: Date.now() + intervalMs,
+    dailyAt: dailyAt || null,      // "HH:MM" 24h local time — overrides intervalMs for daily fire
+    nextRunAt: dailyAt
+      ? computeNextDailyRun(dailyAt)
+      : Date.now() + intervalMs,
     channelId,
+    threadId: threadId || null,    // post back to thread if created from one
     userId,
     createdAt: Date.now(),
     lastRunAt: null,
@@ -87,7 +110,7 @@ export function createSchedule({ prompt, intervalMs, channelId, userId, terminat
   };
   schedules.push(entry);
   saveSchedules();
-  logger.info(`[scheduler] created ${id} — every ${intervalMs}ms, prompt: "${prompt.substring(0, 60)}"`);
+  logger.info(`[scheduler] created ${id}${dailyAt ? ` — daily at ${dailyAt}` : ` — every ${intervalMs}ms`}, prompt: "${prompt.substring(0, 60)}"`);
   return entry;
 }
 

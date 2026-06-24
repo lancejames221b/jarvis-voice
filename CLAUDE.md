@@ -1,8 +1,10 @@
 # OpenJarvis
 
+> **No PII in commits/code — HARD RULE.** Never put personal/identifying info (names, emails, phone numbers, Telegram/Discord numeric IDs, tokens, usernamed paths) into commit messages, code, or tracked files. Keep commit messages generalized and technical. All such data lives in config files (`config.yaml`, `.env`, registries) referenced via env/config, never hardcoded. Scan the staged diff and message before every commit.
+
 OpenJarvis is a Discord-native AI assistant that bridges voice I/O, Claude CLI agents, webhook alerts, and persistent memory. A user speaks or types in a Discord channel; Jarvis transcribes, routes to an AI agent session, and replies in text or voice.
 
-**Repo**: `~/Dev/openjarvis` (gamez dev), `~/dev/jarvis-voice/` on generic (live)
+**Repo**: `~/Dev/openjarvis` (gamez dev), `~/dev/openjarvis/` on generic (live)
 **Package name**: `jarvis-voice` (rename to `openjarvis` is planned — see plan below)
 **Stack**: Node.js ES modules + discord.js v14 + Claude CLI + Python haivemind submodule
 
@@ -50,6 +52,29 @@ Channel-registry helpers in `src/state/focus-state.js`: `isKanbanChannel(channel
 Slash command `/new-kanban-channel name:<…> project-path:<abs-path>` (`src/discord/slash/new-kanban-channel.js`) creates a Discord channel, atomic-writes a `kanbanEnabled: true` registry entry, and bootstraps the workspace by invoking `kanban task list` once.
 
 Skill: `skills/kanban/SKILL.md` — full operations reference. Setup: `skills/kanban/SETUP.md`.
+
+### telegram (`src/telegram/{transport,adapter,registry,engine,format,commands}.js`)
+
+A peer transport on the same brain as Discord/voice. A Telegram chat (or forum topic) behaves like a Discord channel: it binds to a project directory and routes messages to the shared agent.
+
+- `transport.js` — `node-telegram-bot-api` long-polling. `normalizeUpdate(message)` reduces a raw Telegram update to a neutral `{userId,chatId,topicId,text,messageId}` shape (null for non-text); `splitSend()` shapes send options (`message_thread_id` for forum topics); `createTransport(token, onMessage)` wires the live bot.
+- `adapter.js` — the bridge. `handleUpdate()` enforces the access gate, routes slash commands, and sends plain messages to the brain (`generateResponseStreaming`) with a per-chat live-history window; replies are shaped by `terseStatus` (one status line) + `detailBody` (4096-char follow-up chunks). `startTelegram()` is the bootstrap entry, lazy-imported from `src/index.js`'s `ready` handler; it no-ops without `TELEGRAM_BOT_TOKEN`.
+- `registry.js` — `telegramChatKey(chatId, topicId)`, `getTelegramProjectPath(chatKey)`, `registerTelegramChat(chatKey, projectPath)`. Bindings live under a `telegram` key in the same channel-registry file Discord uses.
+- `engine.js` — per-chat engine store (`claude` | `qwen`) at `~/.local/state/jarvis-voice/telegram-engine.json`. `resolveEngineEnv(engine)` returns the `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `model` overrides for the qwen path (LM Studio host from `JARVIS_LMS_BASE_URL`). The gateway applies that overlay to the SAME `claude -p` spawn (see jarvis-gateway `spawnClaudeStream` `engineEnv` argument), so switching engines is an env swap, not a separate client.
+- `format.js` / `commands.js` — pure helpers (watch-formatting and the `/register /engine /model /status /cancel` parser, `@BotName`-suffix aware).
+
+**Session-key shape:** `agent:main:telegram:chat:<chatId>[:topic:<topicId>]`. The gateway's `resolveProfile()` strips the `:topic:<id>` suffix (same path as Discord's `:thread:`), so a forum topic inherits its parent chat's Claude profile.
+
+**Access model:** tier-1 owner (`isOwner`, `TELEGRAM_OWNER_ID`) may run all commands and coding; tier-2 allowlist (`TELEGRAM_ALLOWED_USERS`, comma-separated) gets chat/status only; everyone else is refused. Owner-only commands: `/register`, `/engine`, `/model`, `/cancel`.
+
+**config.yaml block** (mapped to env by `src/config-env-bootstrap.js`):
+
+```yaml
+telegram:
+  token: "<bot token from @BotFather>"
+  owner: "<your telegram numeric user id>"
+  allowedUsers: "<comma-separated tier-2 ids>"   # chat/status only
+```
 
 ### haivemind (`haivemind/` submodule)
 
@@ -126,7 +151,10 @@ Channel accounts (which Claude `--config-path` to use per channel) are separate:
 
 ---
 
-## State Files (live, on generic via SSHFS at `~/mnt/generic/`)
+## State Files (live, on generic)
+
+Access via SSHFS at `~/Dev/generic/` (gamez) or directly at `~/.local/state/jarvis-voice/` on generic.
+Note: `~/mnt/generic/` is empty — the real SSHFS mount is `~/Dev/generic/`.
 
 | File | Purpose |
 |---|---|
@@ -141,27 +169,36 @@ Channel accounts (which Claude `--config-path` to use per channel) are separate:
 
 ## Deploy Workflow
 
-Code is authored and tested on gamez (`~/Dev/openjarvis`), then deployed to generic (`~/dev/jarvis-voice/` on generic) where the live services run. The SSHFS mount at `~/mnt/generic/` (on gamez) must be active for deploy and rollback operations.
+**Model: GitHub is the single source of truth.**
+- gamez authors code, commits, pushes to GitHub
+- generic pulls from GitHub and restarts services
+- No rsync, no SSHFS required for deploys
+
+```
+gamez  →  git push  →  GitHub  →  git pull --ff-only (generic)  →  systemctl restart
+```
 
 ### Deploy with `scripts/deploy.sh`
 
 ```bash
-# Full deploy to live (default target = generic)
+# Full deploy: push branch to GitHub, pull on generic, restart services
 scripts/deploy.sh
 
-# Explicit target
-scripts/deploy.sh generic
+# Push to GitHub only (no restart)
+scripts/deploy.sh --push-only
 
-# Dry-run — shows what would change, no restart, no writes
-scripts/deploy.sh dev
+# Pull + restart on generic only (already pushed)
+scripts/deploy.sh --pull-only
+
+# Dry-run — shows what would happen, makes no changes
+scripts/deploy.sh --dry-run
 ```
 
-The script does:
-1. Verifies the SSHFS mount at `$JARVIS_LIVE_MOUNT` (default `~/mnt/generic/dev/jarvis-voice`) is active (exits with error if not)
-2. Backs up the current live `src/`, `scripts/`, and `package.json` to `../jarvis-voice.bak/` (one generation kept)
-3. Rsyncs `src/`, `scripts/`, and `package.json` from dev to the SSHFS-mounted live path
-4. SSHes to generic and restarts both services: `systemctl --user restart jarvis-gateway jarvis-voice`
-5. Waits 3 seconds, checks `is-active` for both units, tails 60 lines of combined logs to confirm clean startup
+The script:
+1. Pushes current branch to `origin` (GitHub)
+2. Checks live tree on generic for dirty tracked files (would block `--ff-only`)
+3. `git pull --ff-only origin <branch>` on generic
+4. Restarts both services, waits 3s, checks `is-active`, tails startup logs
 
 ### Systemd services (on generic, `--user`)
 
@@ -193,17 +230,11 @@ ssh generic "journalctl --user -u jarvis-voice -u jarvis-gateway -b --no-pager |
 
 ### Rolling back a bad deploy
 
-`scripts/deploy.sh` saves the previous live state to `../jarvis-voice.bak/` before every deploy. To roll back:
+Since the live tree is a git checkout, rollback is a `git reset`:
 
 ```bash
-# Restore via SSHFS
-LIVE=~/mnt/generic/dev/jarvis-voice
-BAK=~/mnt/generic/dev/jarvis-voice.bak
-rsync -avz --delete "$BAK/src/"     "$LIVE/src/"
-rsync -avz --delete "$BAK/scripts/" "$LIVE/scripts/"
-cp "$BAK/package.json" "$LIVE/package.json"
-
-# Restart after rollback
+# Roll back one commit on generic
+ssh generic "cd /home/generic/dev/openjarvis && git reset --hard HEAD^"
 ssh generic "systemctl --user restart jarvis-gateway jarvis-voice"
 
 # Confirm
@@ -211,7 +242,7 @@ ssh generic "systemctl --user is-active jarvis-voice jarvis-gateway"
 ssh generic "journalctl --user -u jarvis-voice -u jarvis-gateway --since '20 seconds ago' --no-pager -n 40"
 ```
 
-Only one backup generation is kept — a subsequent deploy will overwrite `jarvis-voice.bak/`.
+To roll back to a specific commit: `git reset --hard <sha>` on generic.
 
 ---
 

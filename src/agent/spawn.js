@@ -14,6 +14,7 @@ import { verboseSessions } from '../discord/verbose-sessions.js';
 import { mentionSessions } from '../discord/mention-sessions.js';
 import { abortAllVoiceTasks } from '../voice-tasks.js';
 import { ensureWorktree } from './worktree-manager.js';
+import { stopLoop, isLoopRunning } from '../discord/slash/loop.js';
 import logger from '../logger.js';
 
 const GATEWAY_URL      = process.env.JARVIS_GATEWAY_URL || 'http://127.0.0.1:22100';
@@ -163,6 +164,12 @@ export async function handleStopCommand(interaction) {
   // channelId is the thread ID but sessions are stored under the parent channel ID.
   const channel = interaction.channel;
   const lookupId = channel?.isThread?.() ? (channel.parentId || channelId) : channelId;
+
+  // Check active loop in this thread
+  if (stopLoop(channelId) || stopLoop(lookupId)) {
+    await interaction.reply({ content: '🛑 Loop stopped.', ephemeral: false });
+    return;
+  }
 
   // Check spawn session (thread-based agent)
   const spawnSession = _activeSessions.get(channelId) || _activeSessions.get(lookupId);

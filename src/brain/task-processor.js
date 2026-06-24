@@ -165,7 +165,10 @@ export async function processBrainTask(taskId, userId, transcript, history, sign
       }
 
       busEmit('BRAIN', `route=task-agent intent=${intentType} task=#${taskId}`, { userId, taskId });
-      const taskResult = await runTaskAgent(transcript, { ...brainOptions, taskId, userId });
+      // Pass history through — the task-agent gateway path spawns a fresh Claude
+      // session per task (no --resume), so without this the agent has zero memory
+      // of prior voice turns. buildTaskAgentPrompt renders this as a recent-turns block.
+      const taskResult = await runTaskAgent(transcript, { ...brainOptions, taskId, userId, history });
 
       if (taskResult.dispatched) {
         markWorking(taskId);

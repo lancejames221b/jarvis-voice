@@ -25,6 +25,7 @@ const KNOWN_MODELS = [
   'sonnet', 'sonnet-high', 'sonnet-max',
   'opus', 'opus-high', 'opus-max', 'opus-plan',
   'haiku', 'haiku-low',
+  'qwen',
 ];
 
 function _persistModel(alias) {
@@ -46,6 +47,7 @@ import { handleSessionCommand, startSessionDirect, buildResumeCommand } from './
 import { findProjectMapByName } from './slash/project-map.js';
 import { handleNewKanbanChannelCommand } from './slash/new-kanban-channel.js';
 import { handleRegisterChannelCommand } from './slash/register-channel.js';
+import { handleLoopCommand, stopLoop, isLoopRunning } from './slash/loop.js';
 import logger from './logger.js';
 
 const SPAWN_CMD = new SlashCommandBuilder()
@@ -111,6 +113,7 @@ const MODEL_CMD = new SlashCommandBuilder()
             { name: 'opus-plan (deep reasoning)', value: 'opus-plan' },
             { name: 'haiku (fast)', value: 'haiku' },
             { name: 'haiku-low (fastest)', value: 'haiku-low' },
+            { name: 'qwen (LM Studio)', value: 'qwen' },
           ))
       .addBooleanOption(opt =>
         opt.setName('global').setDescription('Change global default instead of pinning to this thread/channel')))
@@ -327,6 +330,23 @@ const SONOS_CMD = new SlashCommandBuilder()
   .addSubcommand(sub => sub.setName('off').setDescription('Disable Sonos mode'))
   .addSubcommand(sub => sub.setName('status').setDescription('Show current Sonos routing'));
 
+const LOOP_CMD = new SlashCommandBuilder()
+  .setName('loop')
+  .setDescription('Run a prompt repeatedly in a thread, using a warm session (context carries across iterations)')
+  .addStringOption(opt =>
+    opt.setName('prompt').setDescription('What to run each iteration').setRequired(true))
+  .addStringOption(opt =>
+    opt.setName('interval').setDescription('How often to run (e.g. 30s, 2m, 1h) — omit for self-pacing'))
+  .addStringOption(opt =>
+    opt.setName('model').setDescription('Model to use: haiku, sonnet (default), opus')
+      .addChoices(
+        { name: 'haiku', value: 'haiku' },
+        { name: 'sonnet', value: 'sonnet' },
+        { name: 'opus', value: 'opus' },
+      ))
+  .addIntegerOption(opt =>
+    opt.setName('max').setDescription('Max iterations before auto-stopping (0 = unlimited)'));
+
 const VISUAL_CMD = new SlashCommandBuilder()
   .setName('visual')
   .setDescription('Toggle visual mode — responses go to text instead of voice')
@@ -355,9 +375,9 @@ export async function registerSlashCommands(client) {
     }
     await rest.put(
       Routes.applicationGuildCommands(client.user.id, guildId),
-      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), NEW_KANBAN_CHANNEL_CMD.toJSON(), REGISTER_CHANNEL_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON()] }
+      { body: [VISUAL_CMD.toJSON(), VERBOSE_CMD.toJSON(), MODEL_CMD.toJSON(), ASK_CMD.toJSON(), MCP_CMD.toJSON(), SYNC_SKILLS_CMD.toJSON(), INIT_CMD.toJSON(), NEW_KANBAN_CHANNEL_CMD.toJSON(), REGISTER_CHANNEL_CMD.toJSON(), SPAWN_CMD.toJSON(), STOP_CMD.toJSON(), CRED_CMD.toJSON(), BOX_CMD.toJSON(), DIR_CMD.toJSON(), SHELL_CMD.toJSON(), ACCESS_CMD.toJSON(), SKILL_CMD.toJSON(), TMUX_CMD.toJSON(), SESSION_CMD.toJSON(), RESUME_CMD.toJSON(), PLAN_CMD.toJSON(), EFFORT_CMD.toJSON(), SPEAKER_CMD.toJSON(), SONOS_CMD.toJSON(), LOOP_CMD.toJSON()] }
     );
-    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /new-kanban-channel, /register-channel, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos commands');
+    logger.info('[slash] Registered /visual, /verbose, /model, /ask, /mcp, /sync-skills, /init, /new-kanban-channel, /register-channel, /spawn, /stop, /cred, /box, /dir, /shell, /access, /skill, /tmux, /session, /resume, /plan, /effort, /speaker, /sonos, /loop commands');
   } catch (err) {
     logger.error(`[slash] Failed to register commands: ${err.message}`);
   }
@@ -1075,6 +1095,15 @@ export async function handleSlashCommand(interaction, allowedUsers) {
       const active = m === 'opus-plan';
       await interaction.reply({ content: `Plan mode: **${active ? 'ON' : 'OFF'}** (current model: \`${m}\`)` });
     }
+    return true;
+  }
+
+  if (interaction.commandName === 'loop') {
+    if (!isChannelOwner(interaction.user.id)) {
+      await interaction.reply({ content: '🚫 Not authorized.', ephemeral: true });
+      return true;
+    }
+    await handleLoopCommand(interaction);
     return true;
   }
 
