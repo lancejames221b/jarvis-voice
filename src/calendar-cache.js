@@ -28,6 +28,11 @@ function parseEvents() {
   let rawText;
   try {
     rawText = readFileSync(CACHE_PATH, 'utf8');
+    // Cache file may be wrapped: {"fetched_at":"...","raw":"..."} — unwrap if so
+    if (rawText.trimStart().startsWith('{')) {
+      const parsed = JSON.parse(rawText);
+      rawText = typeof parsed.raw === 'string' ? parsed.raw : rawText;
+    }
   } catch (err) {
     logger.warn({ err: err.message }, '⚡ calendar-cache: failed to read cache file');
     return [];
