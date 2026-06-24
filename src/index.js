@@ -2762,8 +2762,12 @@ async function handleMentionReply(message, rawContent, isReplyToUs) {
     return;
   }
 
-  // Show typing indicator while we process
+  // Show typing indicator while we process — renew every 8s so it persists for long gateway calls
   try { await message.channel.sendTyping(); } catch (_) {}
+  const _typingInterval = setInterval(() => {
+    try { message.channel.sendTyping().catch(() => {}); } catch (_) {}
+  }, 8000);
+  const _stopTyping = () => clearInterval(_typingInterval);
 
   // Threads are pods inside their parent channel container — separate cursor-agent
   // session per thread, but haivemind context shared with the parent channel.
@@ -5465,6 +5469,7 @@ async function processBrainTask(taskId, userId, transcript, history, signal, bra
       markFailed(taskId, 'aborted');  // Ledger: task aborted
       hudTaskUpdate(taskId, 'failed');
       _visualAccumulator.delete(taskId); // Clean up visual state
+      _stopTyping();
       logger.info(`Task #${taskId} aborted`);
       ttsPipeline.clear();
       audioQueue.setGenerating(false);
@@ -5502,6 +5507,7 @@ async function processBrainTask(taskId, userId, transcript, history, signal, bra
           logger.warn(`⚠️ Contextual ack speak failed: ${e.message}`);
         }
       }
+      _stopTyping();
       postActivity(`**Task #${taskId}** silent (${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
       return;
     }
@@ -5570,6 +5576,7 @@ async function processBrainTask(taskId, userId, transcript, history, signal, bra
       .replace(/(?:^|\s)_?NO_?REPLY(?:\s|[.!?]|$)/gi, ' ')
       .replace(/(?:^|\s)HEARTBEAT_?OK(?:\s|[.!?]|$)/gi, ' ')
       .trim();
+    _stopTyping();
     logger.info(`💬 Task #${taskId} done (${Date.now() - startTime}ms): "${fullText.substring(0, 80)}..."`);
 
 
@@ -5692,6 +5699,7 @@ async function processBrainTask(taskId, userId, transcript, history, signal, bra
     }
 
   } catch (err) {
+    _stopTyping();
     if (err.name !== 'AbortError') {
       markFailed(taskId, err.message);  // Ledger: task failed
       hudTaskUpdate(taskId, 'failed');
