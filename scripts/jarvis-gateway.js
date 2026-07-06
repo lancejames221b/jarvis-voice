@@ -19,11 +19,11 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || `${process.env.HOME}/.local/bin/cla
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const LMS_MODEL = process.env.JARVIS_LMS_MODEL || "qwen/qwen3.6-35b-a3b";
 const MODEL_ALIASES = {
-  claude:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  sonnet:          process.env.DISPATCH_MODEL      || "claude-sonnet-4-6",
-  opus:            process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  claude:          process.env.DISPATCH_MODEL      || "claude-sonnet-5",
+  sonnet:          process.env.DISPATCH_MODEL      || "claude-sonnet-5",
+  opus:            process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-8",
   haiku:           "claude-haiku-4-5-20251001",
-  "opus-plan":     process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-7",
+  "opus-plan":     process.env.DISPATCH_MODEL_DEEP || "claude-opus-4-8",
   // qwen aliases resolve to the LM Studio model ID (engineEnvForModel sets the base URL)
   "qwen":          LMS_MODEL,
   "qwen-focused":  LMS_MODEL,
@@ -55,7 +55,7 @@ function resolveModel(raw) {
   }
   return "";
 }
-const DEFAULT_CLAUDE_MODEL = resolveModel(process.env.DISPATCH_MODEL) || "claude-sonnet-4-6";
+const DEFAULT_CLAUDE_MODEL = resolveModel(process.env.DISPATCH_MODEL) || "claude-sonnet-5";
 
 // Qwen alias → LM Studio env overlay.
 // Temperature tiers:
@@ -97,6 +97,22 @@ const CURSOR_AGENT_TIMEOUT_LMS_MS = parseInt(process.env.GATEWAY_LMS_TIMEOUT_MS 
 // Catches qwen stuck in PROCESSINGPROMPT and any model that accepts the request but never streams.
 // Lower than CURSOR_AGENT_TIMEOUT_MS so we fail fast rather than waiting the full timeout.
 const IDLE_WATCHDOG_MS = parseInt(process.env.GATEWAY_IDLE_WATCHDOG_MS || '90000'); // default 90s
+// Model fallback chain: if a primary model fails (stall, timeout, error), retry once with
+// the mapped fallback. Config via GATEWAY_MODEL_FALLBACKS as JSON or "from:to,from:to" pairs.
+// Example: GATEWAY_MODEL_FALLBACKS={"qwen":"sonnet","qwen-focused":"sonnet"}
+// Example: GATEWAY_MODEL_FALLBACKS=qwen:sonnet,qwen-focused:sonnet
+const MODEL_FALLBACKS = {};
+try {
+  const raw = (process.env.GATEWAY_MODEL_FALLBACKS || "").trim();
+  if (raw.startsWith("{")) {
+    Object.assign(MODEL_FALLBACKS, JSON.parse(raw));
+  } else if (raw) {
+    for (const pair of raw.split(",")) {
+      const idx = pair.indexOf(":");
+      if (idx > 0) { const from = pair.slice(0, idx).trim(); const to = pair.slice(idx + 1).trim(); if (from && to) MODEL_FALLBACKS[from] = to; }
+    }
+  }
+} catch (e) { console.error("GATEWAY_MODEL_FALLBACKS parse error:", e.message); }
 // Stateless channels never use --resume. Every turn sends full collapsed history inline.
 // Context is preserved via brain.js foldHistory; no remote session reload overhead.
 const STATELESS_CHANNEL_IDS = new Set(
@@ -163,6 +179,7 @@ const metrics = {
   hooksAgent: 0,
   rssKills: 0,
   clientAborts: 0,
+  modelFallbacks: 0,
 };
 
 // ── Session persistence ───────────────────────────────────────────────────────
@@ -942,6 +959,7 @@ app.get("/models", requireAuth, (_req, res) => {
   res.json({
     aliases: Object.entries(MODEL_ALIASES).map(([alias, model]) => ({ alias, model })),
     default: DEFAULT_CLAUDE_MODEL,
+    fallbacks: MODEL_FALLBACKS,
   });
 });
 
@@ -1061,27 +1079,56 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
       res.setHeader("Connection", "keep-alive");
 
       let resolvedSessionId;
+      let activeModel = requestedModel;
+      let activeEngine = requestedEngine;
       try {
         resolvedSessionId = await streamClaudeToSSE(prompt, model, chatId, res, req, channelKey, effort, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
       } catch (streamError) {
         releaseLock();
         // Don't try to write to a closed/aborted socket.
         if (streamError.message === "client disconnected" || res.writableEnded || req.destroyed) return;
-        log("stream_error", { channelKey, model, error: streamError.message });
-        res.write(`data: ${JSON.stringify({ error: streamError.message })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
-        return;
+        // Model fallback: if a fallback is configured and this wasn't already a fallback attempt,
+        // retry once with the fallback model using full collapsed history as the prompt.
+        const fallbackAlias = MODEL_FALLBACKS[requestedModel];
+        if (fallbackAlias) {
+          metrics.modelFallbacks++;
+          log("model_fallback", { channelKey, from: requestedModel, to: fallbackAlias, error: streamError.message });
+          const notifyChunk = { id: `chatcmpl-${crypto.randomUUID()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: fallbackAlias, choices: [{ index: 0, delta: { content: `\n_[${requestedModel} stalled — retrying with ${fallbackAlias}]_\n` }, finish_reason: null }] };
+          res.write(`data: ${JSON.stringify(notifyChunk)}\n\n`);
+          const fbResolved = resolveModel(fallbackAlias) || DEFAULT_CLAUDE_MODEL;
+          const fbEffort = effortForAlias(fallbackAlias);
+          const fbEngineEnv = engineEnvForModel(fallbackAlias) || null;
+          const fbPrompt = collapseMessages(req.body?.messages || []);
+          try {
+            resolvedSessionId = await streamClaudeToSSE(fbPrompt, fbResolved, null, res, req, channelKey, fbEffort, fbEngineEnv);
+            activeModel = fallbackAlias;
+            activeEngine = engineForModel(fallbackAlias);
+          } catch (fbErr) {
+            if (!res.writableEnded && !req.destroyed) {
+              log("stream_fallback_error", { channelKey, model: fallbackAlias, error: fbErr.message });
+              res.write(`data: ${JSON.stringify({ error: fbErr.message })}\n\n`);
+              res.write("data: [DONE]\n\n");
+              res.end();
+            }
+            return;
+          }
+        } else {
+          log("stream_error", { channelKey, model, error: streamError.message });
+          res.write(`data: ${JSON.stringify({ error: streamError.message })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        }
       }
 
-      setSession(channelKey, resolvedSessionId, requestedEngine);
+      setSession(channelKey, resolvedSessionId, activeEngine);
       releaseLock();
 
       res.write(`data: ${JSON.stringify({
         id: `chatcmpl-${crypto.randomUUID()}`,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: requestedModel,
+        model: activeModel,
         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       })}\n\n`);
       res.write("data: [DONE]\n\n");
@@ -1090,7 +1137,23 @@ app.post("/v1/chat/completions", requireAuth, async (req, res) => {
     }
 
     // Non-streaming path
-    const result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
+    let result;
+    try {
+      result = await callClaudeAgent(prompt, requestedModel, chatId, channelKey, req.body?.engineEnv || engineEnvForModel(requestedModel) || null);
+    } catch (agentError) {
+      const fallbackAlias = MODEL_FALLBACKS[requestedModel];
+      if (fallbackAlias) {
+        metrics.modelFallbacks++;
+        log("model_fallback", { channelKey, from: requestedModel, to: fallbackAlias, error: agentError.message });
+        const fbPrompt = collapseMessages(req.body?.messages || []);
+        result = await callClaudeAgent(fbPrompt, fallbackAlias, null, channelKey, engineEnvForModel(fallbackAlias) || null);
+        setSession(channelKey, result.sessionId, engineForModel(fallbackAlias));
+        releaseLock();
+        res.json(openAiCompletionResponse(fallbackAlias, result.text));
+        return;
+      }
+      throw agentError;
+    }
     setSession(channelKey, result.sessionId, requestedEngine);
     releaseLock();
     res.json(openAiCompletionResponse(requestedModel, result.text));
